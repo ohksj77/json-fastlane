@@ -1,128 +1,194 @@
 # json-fastlane
 
-[한국어](README.ko.md)
+[한국어](README.ko.md) · [Design](docs/DESIGN.md) · [Performance](docs/PERFORMANCE.md) · [Roadmap](docs/ROADMAP.md) · [License](LICENSE)
 
-`json-fastlane` is a JVM experiment for profile-guided JSON serialization.
+`json-fastlane` is an experimental JVM library for **profile-guided JSON fast
+paths**.
 
-The idea is not to replace Jackson on day one. The first goal is to observe
-real API payload shapes, identify endpoints where JSON is expensive, then route
-hot DTOs through generated fast-path codecs with a safe fallback.
+It watches real API JSON, finds stable hot payload shapes, and lets selected
+DTOs move to generated low-allocation readers, writers, and transport sinks.
+Jackson, Spring, or your existing JSON stack stays as the compatibility
+fallback.
 
-## Current prototype
+## Why
 
-- Records top-level JSON field shape per endpoint.
-- Tracks field order, field value kinds, payload size, and sample count.
-- Includes generated-style UTF-8 reader and writer examples with no reflection.
-- Includes a reusable UTF-8 buffer writer path for lower-allocation response serialization.
-- Includes a Spring MVC Jackson profiling converter prototype.
+General-purpose JSON libraries are designed for broad compatibility. That is
+the right default.
 
-## Modules
+But many production APIs repeatedly send the same stable DTO shapes. For those
+hot paths, `json-fastlane` explores a narrower idea:
 
-- `json-fastlane-core`: dependency-light profiling, reader/writer contracts,
-  fallback tracking, UTF-8 buffer, and generated-style examples.
-- `json-fastlane-spring`: Spring MVC converters, generated writer registry, and
-  Jackson fallback/profiling integration.
-- `json-fastlane-netty`: Netty `ByteBuf` writer scaffold for pooled-buffer
-  WebFlux/Reactor Netty style integrations.
-- `json-fastlane-benchmarks`: smoke checks, realistic load simulation, JFR run,
-  and JMH benchmarks.
+1. observe real JSON shape per endpoint
+2. prove the shape is stable enough
+3. route only that shape to generated code
+4. fall back when the shape drifts
 
-## Run
+The fast path is an optimization. Correctness still belongs to the fallback
+until a generated codec covers the case safely.
+
+## What It Does
+
+- Profiles endpoint JSON shape from raw UTF-8 bytes.
+- Tracks field order, value kind, payload size, sample count, and dropped shapes.
+- Registers expected JSON shapes from samples or code.
+- Compiles exact shape matchers for hot-path routing.
+- Computes 128-bit key/depth/value-kind fingerprints with checkpointed early rejection.
+- Generates Java record writers with `@JsonFastlaneGenerateWriter`.
+- Writes to `Utf8JsonBuffer`, Netty `ByteBuf`, or `OutputStream` through `JsonSink`.
+- Provides Spring MVC and Netty adapter prototypes.
+- Exports text reports, metrics sink events, and JFR snapshots.
+
+## Status
+
+Implemented today:
+
+| Area | State |
+| --- | --- |
+| Shape profiler | Byte scanner, bounded endpoint/order tracking, compact field-order storage. |
+| Shape guards | Exact matcher, fingerprint matcher, checkpointed early rejection. |
+| Writer generation | Java record writer processor with expected-shape metadata. |
+| Transport lane | `JsonSink` targets for UTF-8, Netty, and `OutputStream`. |
+| Spring/Netty adapters | Prototype converters and writer registries. |
+| Validation | Smoke checks, realistic load simulation, JMH scaffold, JFR task. |
+
+Still experimental:
+
+| Area | Limit |
+| --- | --- |
+| ObjectMapper replacement | Not yet. The project replaces selected hot DTO paths and keeps fallback. |
+| Reader generation | Contracts and prototypes exist; processor-generated readers are future work. |
+| Jackson feature parity | Naming strategies, custom serializers, polymorphism, date/time policy, and full annotation behavior remain fallback territory. |
+| Network stack | Transport sinks are executable, but not a complete end-to-end zero-copy runtime. |
+
+## How It Works
+
+```mermaid
+flowchart LR
+    traffic["API JSON traffic"]
+    profiler["Shape profiler"]
+    decision["Hot stable shape?"]
+    matcher["Hash or exact matcher"]
+    fast["Generated fast path"]
+    fallback["Existing JSON stack"]
+    output["byte[], buffer, ByteBuf, OutputStream"]
+
+    traffic --> profiler --> decision
+    decision --> matcher
+    matcher --> fast --> output
+    matcher --> fallback --> output
+```
+
+## Quick Start
+
+Run the local checks:
 
 ```bash
-./gradlew :json-fastlane-core:run
 ./gradlew check
 ./gradlew realisticLoadTest
-./gradlew realisticLoadTest -PloadThreads=16 -PloadIterations=50000
-./gradlew jfrRealisticLoadTest
 ./gradlew jmh -PjmhWarmups=1 -PjmhIterations=1 -PjmhForks=1
 ```
 
-## Spring MVC adapter
-
-The prototype includes a profiling Jackson converter:
+Record shapes:
 
 ```java
-JsonConversionProfiler profiler = new JsonConversionProfiler();
-FastJsonWriterRegistry writerRegistry = new FastJsonWriterRegistry();
-ProfilingJackson2HttpMessageConverter converter =
-    new ProfilingJackson2HttpMessageConverter(objectMapper, profiler, writerRegistry);
+JsonFastlane fastlane = new JsonFastlane();
 
-writerRegistry.register(OrderSummaryResponse.class, new OrderSummaryResponseWriter());
-```
+fastlane.record("/orders", "{\"userId\":1,\"items\":[],\"couponCode\":null}");
+fastlane.record("/orders", "{\"userId\":2,\"items\":[],\"couponCode\":\"HELLO\"}");
 
-If a registered `FastJsonBufferWriter` exists for the response type, the
-converter writes through:
-
-```text
-DTO -> reusable Utf8JsonBuffer -> response OutputStream
-```
-
-Otherwise, it falls back to Jackson. In a Spring MVC app, replace the first
-Jackson converter during Web MVC setup:
-
-```java
-@Configuration
-class JsonFastlaneWebConfig implements WebMvcConfigurer {
-    private final ObjectMapper objectMapper;
-    private final JsonConversionProfiler profiler = new JsonConversionProfiler();
-    private final FastJsonWriterRegistry writerRegistry = new FastJsonWriterRegistry();
-
-    JsonFastlaneWebConfig(ObjectMapper objectMapper) {
-        this.objectMapper = objectMapper;
-        this.writerRegistry.register(OrderSummaryResponse.class, new OrderSummaryResponseWriter());
-    }
-
-    @Override
-    public void extendMessageConverters(List<HttpMessageConverter<?>> converters) {
-        SpringJsonFastlaneConfigurer.replaceFirstJacksonConverter(converters, profiler, writerRegistry);
-    }
+for (EndpointProfileSnapshot snapshot : fastlane.snapshots()) {
+    System.out.println(snapshot.endpoint());
+    System.out.println(snapshot.fieldOrders());
 }
 ```
 
-An interceptor or filter should set the current endpoint around request handling:
+Register a known shape:
 
 ```java
-try (JsonFastlaneSpring.EndpointScope ignored =
-         JsonFastlaneSpring.withCurrentEndpoint("/orders")) {
-    // Spring request handling continues here.
+fastlane.registerExpectedShape("/orders", ExpectedJsonShape.object(
+    ExpectedJsonField.field("userId", JsonValueKind.NUMBER),
+    ExpectedJsonField.field("items", JsonValueKind.ARRAY),
+    ExpectedJsonField.field("couponCode", JsonValueKind.NULL)
+));
+```
+
+Route a stable payload:
+
+```java
+JsonShapeMatcher matcher = ExpectedJsonShape.object(
+    ExpectedJsonField.field("userId", JsonValueKind.NUMBER),
+    ExpectedJsonField.field("items", JsonValueKind.ARRAY),
+    ExpectedJsonField.field("couponCode", JsonValueKind.NULL)
+).compileMatcher();
+
+if (matcher.matches(bodyBytes)) {
+    // generated fast path
+} else {
+    // existing JSON stack
 }
 ```
 
-The converter records:
+Generate a writer for a Java record:
 
-- read/write direction
-- endpoint
-- Java type
-- average payload bytes
-- average conversion time
-- JSON field shape through the core profiler
+```java
+@JsonFastlaneGenerateWriter
+public record Invoice(long id, String email, List<InvoiceLine> lines) {
+}
 
-## Realistic load simulation
+JsonFastlaneGeneratedWriter<Invoice> writer = new InvoiceJsonFastlaneWriter();
 
-`realisticLoadTest` runs an in-process load model for two API shapes:
+writer.write(invoice, utf8Buffer);
+writer.write(invoice, new Utf8JsonSink(utf8Buffer));
+writer.write(invoice, new NettyJsonSink(byteBuf));
+writer.write(invoice, new OutputStreamJsonSink(outputStream));
+```
 
-- `POST /checkout`: nested request JSON with cart items, address, coupon, and trace id.
-- `GET /orders/{id}/summary`: nested response JSON with 12 order lines, shipping, payment, timeline, and memo.
+## Modules
 
-It compares:
+| Module | Purpose |
+| --- | --- |
+| `json-fastlane-core` | Profiler, shape matchers, fingerprints, codec contracts, reports, UTF-8 buffer, transport sinks. |
+| `json-fastlane-processor` | Annotation processor for Java record writers. |
+| `json-fastlane-spring` | Spring MVC profiling and generated-writer converters. |
+| `json-fastlane-netty` | Netty `ByteBuf` writer registry, buffer, and sink. |
+| `json-fastlane-benchmarks` | Smoke checks, realistic load simulation, JMH, and JFR tasks. |
 
-- Jackson deserialization
-- profiling Spring converter deserialization
-- generated-style fast reader deserialization
-- Jackson serialization
-- profiling Spring converter serialization
-- generated-style fast writer serialization
-- generated-style reusable-buffer writer serialization
-- Spring converter direct generated writer serialization
+## Performance Snapshot
 
-The task prints throughput, p50/p95/p99 latency, converter profiling snapshots,
-and observed JSON field shapes. The generated writer output is also parsed and
-compared with Jackson JSON before the load test starts.
+Short local run, same payloads, relative to the comparable baseline:
 
-## Direction
+| Path | Result |
+| --- | ---: |
+| Generated reader vs Jackson read | 3.44x, 888 B/op |
+| Generated writer vs Jackson write | 1.88x, 3,872 B/op |
+| Reused buffer writer vs Jackson write | 2.10x, 48 B/op |
+| Transport Netty sink vs Jackson write | 1.37x, 80 B/op |
+| Spring transport converter vs Spring default write | 1.85x, 1,408 B/op |
 
-1. Generate DTO-specific readers/writers from observed endpoint shapes.
-2. Export endpoint JSON cost reports through logs, Micrometer, and JFR events.
-3. Add fallback-rate tracking for generated readers.
-4. Keep Jackson as fallback for unknown shapes and compatibility.
+These are local health-check numbers, not universal claims. See
+[Performance Validation](docs/PERFORMANCE.md) for role-by-role scenario tables,
+baseline labels, JMH output, and interpretation.
+
+## Documentation
+
+| Document | What to read there |
+| --- | --- |
+| [Design Notes](docs/DESIGN.md) | Architecture, fallback rules, shape hashing, transport lane boundaries. |
+| [Performance Validation](docs/PERFORMANCE.md) | Scenario-by-scenario comparisons and benchmark interpretation. |
+| [Roadmap](docs/ROADMAP.md) | Completed work, experimental areas, and next deep tasks. |
+
+Korean docs are available as [설계 노트](docs/DESIGN.ko.md),
+[성능 검증](docs/PERFORMANCE.ko.md), and [로드맵](docs/ROADMAP.ko.md).
+
+## Technical Notes
+
+- Java 17 bytecode.
+- Apache License 2.0.
+- `json-fastlane-core` has no Spring, Jackson, or Netty dependency.
+- Spring and Netty adapters live in separate modules.
+- Profiler paths avoid monitor locks and thread-local endpoint scope.
+- Endpoint count, retained orders, field scan width, and nesting depth are bounded by options.
+
+## License
+
+`json-fastlane` is licensed under the [Apache License 2.0](LICENSE).

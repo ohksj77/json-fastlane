@@ -16,6 +16,7 @@ rootProject.name = "json-fastlane"
 
 include(
     "json-fastlane-core",
+    "json-fastlane-processor",
     "json-fastlane-spring",
     "json-fastlane-netty",
     "json-fastlane-benchmarks"

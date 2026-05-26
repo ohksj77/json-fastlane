@@ -1,5 +1,7 @@
 package io.jsonfastlane;
 
+import io.jsonfastlane.transport.JsonSegment;
+
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.Arrays;
@@ -58,6 +60,10 @@ public final class Utf8JsonBuffer {
         System.arraycopy(value, 0, bytes, size, value.length);
         size += value.length;
         return this;
+    }
+
+    public Utf8JsonBuffer writeSegment(JsonSegment segment) {
+        return writeRaw(segment.bytes());
     }
 
     public Utf8JsonBuffer writeLong(long value) {

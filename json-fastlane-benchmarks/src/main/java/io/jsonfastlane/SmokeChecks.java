@@ -13,6 +13,16 @@ public final class SmokeChecks {
 
     public static void main(String[] args) {
         recordsEndpointShapes();
+        recordsEscapedFieldNames();
+        ignoresMalformedJson();
+        appliesProfileOptions();
+        enforcesShapeScanLimits();
+        primesExpectedShapes();
+        matchesCompiledShapes();
+        hashesJsonShapes();
+        keepsEndpointProfilesBounded();
+        exportsReportsAndMetrics();
+        writesWithGeneratedCodecContract();
         writesGeneratedStyleJson();
         System.out.println("Smoke checks passed.");
     }
@@ -35,6 +45,169 @@ public final class SmokeChecks {
         require(coupon.valueKinds().get(JsonValueKind.STRING) == 1, "string coupon count");
     }
 
+    private static void recordsEscapedFieldNames() {
+        JsonFastlane fastlane = new JsonFastlane();
+        fastlane.record("/orders", "{\"user\\u0049d\":1}");
+        fastlane.record("/orders", "{\"userId\":2}");
+
+        EndpointProfileSnapshot snapshot = fastlane.snapshots().iterator().next();
+        require(snapshot.fields().size() == 1, "escaped field canonicalization");
+        require(snapshot.fields().get(0).name().equals("userId"), "escaped field name");
+        require(snapshot.fields().get(0).valueKinds().get(JsonValueKind.NUMBER) == 2, "escaped field count");
+    }
+
+    private static void ignoresMalformedJson() {
+        JsonFastlane fastlane = new JsonFastlane();
+        try {
+            fastlane.record("/bad", "{\"userId\":");
+            throw new AssertionError("Failed: malformed JSON exception");
+        } catch (IllegalArgumentException expected) {
+            require(fastlane.snapshots().isEmpty(), "malformed JSON profile");
+        }
+    }
+
+    private static void appliesProfileOptions() {
+        JsonFastlane fastlane = new JsonFastlane(new JsonFastlaneOptions(1, 0));
+        fastlane.record("/orders", "{\"userId\":1,\"items\":[]}");
+        fastlane.record("/orders", "{\"items\":[],\"userId\":2}");
+
+        EndpointProfileSnapshot snapshot = fastlane.snapshots().iterator().next();
+        require(snapshot.fieldOrders().size() == 1, "retained field order limit");
+        require(snapshot.droppedFieldOrders() == 1, "dropped field order count");
+        require(snapshot.fields().size() == 2, "field profile retention");
+    }
+
+    private static void enforcesShapeScanLimits() {
+        JsonFastlane fastlane = new JsonFastlane(new JsonFastlaneOptions(8, 8, 1, 2));
+        try {
+            fastlane.record("/wide", "{\"a\":1,\"b\":2}");
+            throw new AssertionError("Failed: top-level field limit exception");
+        } catch (IllegalArgumentException expected) {
+            require(fastlane.snapshots().isEmpty(), "wide JSON profile");
+        }
+
+        try {
+            fastlane.record("/deep", "{\"a\":{\"b\":{\"c\":1}}}");
+            throw new AssertionError("Failed: nesting depth limit exception");
+        } catch (IllegalArgumentException expected) {
+            require(fastlane.snapshots().isEmpty(), "deep JSON profile");
+        }
+    }
+
+    private static void primesExpectedShapes() {
+        JsonFastlane fastlane = new JsonFastlane();
+        fastlane.registerExpectedShape("/orders", "{\"userId\":0,\"items\":[],\"couponCode\":null}");
+        fastlane.registerExpectedShape("/orders", "{\"userId\":0,\"items\":[],\"gift\":false}");
+        fastlane.registerExpectedShape("/orders", ExpectedJsonShape.object(
+            ExpectedJsonField.field("status", JsonValueKind.STRING),
+            ExpectedJsonField.field("message", JsonValueKind.STRING)
+        ));
+
+        EndpointProfileSnapshot primed = fastlane.snapshots().iterator().next();
+        require(primed.samples() == 0, "primed shape sample count");
+        require(primed.fieldOrders().isEmpty(), "primed shape order samples");
+        require(primed.fields().size() == 6, "primed field dictionary");
+
+        fastlane.record("/orders", "{\"userId\":1,\"items\":[],\"gift\":true}");
+        EndpointProfileSnapshot recorded = fastlane.snapshots().iterator().next();
+        require(recorded.samples() == 1, "recorded sample after priming");
+        require(recorded.fieldOrders().get(0).signature().equals("userId,items,gift"), "primed hot path order");
+    }
+
+    private static void matchesCompiledShapes() {
+        JsonShapeMatcher matcher = ExpectedJsonShape.object(
+            ExpectedJsonField.field("userId", JsonValueKind.NUMBER),
+            ExpectedJsonField.field("items", JsonValueKind.ARRAY),
+            ExpectedJsonField.field("couponCode", JsonValueKind.NULL)
+        ).compileMatcher();
+
+        require(matcher.matches("{\"userId\":1,\"items\":[],\"couponCode\":null}"), "compiled shape match");
+        require(!matcher.matches("{\"items\":[],\"userId\":1,\"couponCode\":null}"), "compiled shape order mismatch");
+        require(!matcher.matches("{\"userId\":1,\"items\":[],\"couponCode\":\"A\"}"), "compiled shape kind mismatch");
+    }
+
+    private static void hashesJsonShapes() {
+        JsonShapeFingerprint left = JsonShapeFingerprinter.fingerprint(
+            "{\"userId\":1,\"items\":[{\"sku\":\"A\",\"quantity\":2}],\"shipping\":{\"city\":\"Seoul\"}}"
+        );
+        JsonShapeFingerprint sameShape = JsonShapeFingerprinter.fingerprint(
+            "{\"userId\":99,\"items\":[{\"sku\":\"B\",\"quantity\":10}],\"shipping\":{\"city\":\"Busan\"}}"
+        );
+        JsonShapeFingerprint differentOrder = JsonShapeFingerprinter.fingerprint(
+            "{\"items\":[{\"sku\":\"A\",\"quantity\":2}],\"userId\":1,\"shipping\":{\"city\":\"Seoul\"}}"
+        );
+        JsonShapeFingerprint differentDepth = JsonShapeFingerprinter.fingerprint(
+            "{\"userId\":1,\"items\":[{\"sku\":\"A\",\"quantity\":2}],\"shipping\":{\"address\":{\"city\":\"Seoul\"}}}"
+        );
+        JsonShapeFingerprint escaped = JsonShapeFingerprinter.fingerprint(
+            "{\"user\\u0049d\":1,\"items\":[{\"sku\":\"A\",\"quantity\":2}],\"shipping\":{\"city\":\"Seoul\"}}"
+        );
+
+        require(left.sameHash(sameShape), "shape hash ignores scalar values");
+        require(!left.sameHash(differentOrder), "shape hash detects order");
+        require(!left.sameHash(differentDepth), "shape hash detects depth");
+        require(left.sameHash(escaped), "shape hash canonicalizes escaped field names");
+        require(left.fieldCount() == 6, "shape hash field count");
+        require(left.maxKeyDepth() == 2, "shape hash max key depth");
+
+        JsonShapeFingerprintPlan plan = JsonShapeFingerprinter.plan(
+            "{\"userId\":1,\"items\":[{\"sku\":\"A\",\"quantity\":2}],\"shipping\":{\"city\":\"Seoul\"}}"
+        );
+        require(plan.checkpoints().size() == 3, "shape hash checkpoints");
+
+        JsonShapeHashMatcher matcher = plan.matcher();
+        require(matcher.checkpointCount() == 3, "shape hash matcher checkpoints");
+        require(JsonShapeHashMatcher.fromSample(
+            "{\"userId\":1,\"items\":[{\"sku\":\"A\",\"quantity\":2}],\"shipping\":{\"city\":\"Seoul\"}}"
+        ).checkpointCount() == 3, "sample hash matcher checkpoints");
+        require(matcher.matches(
+            "{\"userId\":2,\"items\":[{\"sku\":\"B\",\"quantity\":3}],\"shipping\":{\"city\":\"Incheon\"}}"
+        ), "shape hash matcher hit");
+        require(!matcher.matches(
+            "{\"userId\":2,\"items\":[{\"sku\":\"B\",\"count\":3}],\"shipping\":{\"city\":\"Incheon\"}}"
+        ), "shape hash matcher miss");
+
+        JsonShapeMatcher exactTopLevel = ExpectedJsonShape.object(
+            ExpectedJsonField.field("userId", JsonValueKind.NUMBER),
+            ExpectedJsonField.field("items", JsonValueKind.ARRAY),
+            ExpectedJsonField.field("shipping", JsonValueKind.OBJECT)
+        ).compileMatcher();
+        JsonShapeMatcher verified = matcher.verifiedBy(exactTopLevel);
+        require(verified.matches(
+            "{\"userId\":2,\"items\":[{\"sku\":\"B\",\"quantity\":3}],\"shipping\":{\"city\":\"Incheon\"}}"
+        ), "verified shape hash matcher hit");
+    }
+
+    private static void keepsEndpointProfilesBounded() {
+        JsonFastlane fastlane = new JsonFastlane(new JsonFastlaneOptions(8, 8, 8, 8, 1));
+        fastlane.record("/one", "{\"a\":1}");
+        fastlane.record("/two", "{\"a\":1}");
+
+        require(fastlane.snapshots().size() == 1, "bounded endpoint profiles");
+        require(fastlane.droppedEndpointObservations() == 1, "dropped endpoint observations");
+    }
+
+    private static void exportsReportsAndMetrics() {
+        JsonFastlane fastlane = new JsonFastlane();
+        fastlane.record("/orders", "{\"userId\":1,\"items\":[]}");
+
+        String report = JsonFastlaneReport.text(fastlane.snapshots());
+        require(report.contains("/orders"), "text report endpoint");
+        require(report.contains("hotOrder=userId,items"), "text report hot order");
+
+        CountingMetricsSink sink = new CountingMetricsSink();
+        JsonFastlaneReport.emitMetrics(fastlane.snapshots(), sink);
+        require(sink.metrics == 3, "metric export count");
+    }
+
+    private static void writesWithGeneratedCodecContract() {
+        OrderIdCodec codec = new OrderIdCodec();
+        byte[] json = codec.writeToBytes(7L);
+
+        require(new String(json, StandardCharsets.UTF_8).equals("{\"orderId\":7}"), "codec write bytes");
+        require(codec.read(json) == 7L, "codec read bytes");
+    }
+
     private static void writesGeneratedStyleJson() {
         CreateOrderRequestWriter writer = new CreateOrderRequestWriter();
         byte[] json = writer.write(new CreateOrderRequest(
@@ -51,6 +224,38 @@ public final class SmokeChecks {
     private static void require(boolean condition, String label) {
         if (!condition) {
             throw new AssertionError("Failed: " + label);
+        }
+    }
+
+    private static final class CountingMetricsSink implements JsonFastlaneMetricsSink {
+        private int metrics;
+
+        @Override
+        public void endpointSampleCount(String endpoint, long samples) {
+            metrics++;
+        }
+
+        @Override
+        public void endpointAveragePayloadBytes(String endpoint, long averagePayloadBytes) {
+            metrics++;
+        }
+
+        @Override
+        public void endpointDroppedFieldOrders(String endpoint, long droppedFieldOrders) {
+            metrics++;
+        }
+    }
+
+    private static final class OrderIdCodec implements FastJsonCodec<Long> {
+        @Override
+        public Long read(byte[] utf8Json) {
+            String json = new String(utf8Json, StandardCharsets.UTF_8);
+            return Long.parseLong(json.substring("{\"orderId\":".length(), json.length() - 1));
+        }
+
+        @Override
+        public void write(Long value, Utf8JsonBuffer out) {
+            out.writeAscii("{\"orderId\":").writeLong(value).writeByte('}');
         }
     }
 }

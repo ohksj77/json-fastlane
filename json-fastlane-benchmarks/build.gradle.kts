@@ -8,6 +8,7 @@ dependencies {
     implementation(project(":json-fastlane-netty"))
     implementation("com.fasterxml.jackson.core:jackson-databind:2.21.2")
     implementation("org.openjdk.jmh:jmh-core:1.37")
+    annotationProcessor(project(":json-fastlane-processor"))
     annotationProcessor("org.openjdk.jmh:jmh-generator-annprocess:1.37")
 }
 
@@ -59,6 +60,27 @@ val springAdapterSmokeTest by tasks.registering(JavaExec::class) {
     mainClass.set("io.jsonfastlane.SpringAdapterSmokeChecks")
 }
 
+val nettySmokeTest by tasks.registering(JavaExec::class) {
+    group = "verification"
+    description = "Runs smoke checks for Netty ByteBuf writer routing."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("io.jsonfastlane.NettySmokeChecks")
+}
+
+val generatedWriterSmokeTest by tasks.registering(JavaExec::class) {
+    group = "verification"
+    description = "Runs smoke checks for annotation-processor generated JSON writers."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("io.jsonfastlane.GeneratedWriterSmokeChecks")
+}
+
+val transportLaneSmokeTest by tasks.registering(JavaExec::class) {
+    group = "verification"
+    description = "Runs smoke checks for experimental transport-lane JSON sinks."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("io.jsonfastlane.TransportLaneSmokeChecks")
+}
+
 val realisticLoadTest by tasks.registering(JavaExec::class) {
     group = "verification"
     description = "Runs a realistic in-process JSON serialization load simulation."
@@ -94,4 +116,7 @@ tasks.named<Test>("test") {
 tasks.named("check") {
     dependsOn(smokeTest)
     dependsOn(springAdapterSmokeTest)
+    dependsOn(nettySmokeTest)
+    dependsOn(generatedWriterSmokeTest)
+    dependsOn(transportLaneSmokeTest)
 }

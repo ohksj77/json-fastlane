@@ -9,36 +9,69 @@ final class JsonShapeScanner {
     }
 
     static JsonShapeObservation scan(byte[] utf8Json) {
-        Parser parser = new Parser(new String(utf8Json, StandardCharsets.UTF_8));
-        return parser.scan(utf8Json.length);
+        return scan(utf8Json, JsonFastlaneOptions.defaults());
+    }
+
+    static JsonShapeObservation scan(byte[] utf8Json, JsonFastlaneOptions options) {
+        return scan(utf8Json, FieldNameResolver.DEFAULT, options);
+    }
+
+    static JsonShapeObservation scan(byte[] utf8Json, FieldNameResolver fieldNameResolver) {
+        return scan(utf8Json, fieldNameResolver, JsonFastlaneOptions.defaults());
+    }
+
+    static JsonShapeObservation scan(
+        byte[] utf8Json,
+        FieldNameResolver fieldNameResolver,
+        JsonFastlaneOptions options
+    ) {
+        Parser parser = new Parser(utf8Json, fieldNameResolver, options);
+        return parser.scan();
+    }
+
+    interface FieldNameResolver {
+        FieldNameResolver DEFAULT = new FieldNameResolver() {
+        };
+
+        default String resolveUnescapedFieldName(byte[] utf8Json, int start, int end) {
+            return new String(utf8Json, start, end - start, StandardCharsets.UTF_8);
+        }
+
+        default String canonicalFieldName(String name) {
+            return name;
+        }
     }
 
     private static final class Parser {
-        private final String json;
+        private final byte[] bytes;
+        private final FieldNameResolver fieldNameResolver;
+        private final JsonFastlaneOptions options;
         private int index;
 
-        private Parser(String json) {
-            this.json = json;
+        private Parser(byte[] bytes, FieldNameResolver fieldNameResolver, JsonFastlaneOptions options) {
+            this.bytes = bytes;
+            this.fieldNameResolver = fieldNameResolver;
+            this.options = options;
         }
 
-        private JsonShapeObservation scan(int payloadBytes) {
+        private JsonShapeObservation scan() {
             skipWhitespace();
             if (isAtEnd()) {
-                return new JsonShapeObservation(payloadBytes, JsonValueKind.UNKNOWN, List.of(), "");
+                return new JsonShapeObservation(bytes.length, JsonValueKind.UNKNOWN, List.of());
             }
 
-            char current = json.charAt(index);
+            int current = bytes[index] & 0xff;
             if (current == '{') {
                 List<FieldObservation> fields = scanRootObject();
-                return new JsonShapeObservation(payloadBytes, JsonValueKind.OBJECT, fields, signature(fields));
+                return new JsonShapeObservation(bytes.length, JsonValueKind.OBJECT, fields);
             }
             if (current == '[') {
-                skipArray();
-                return new JsonShapeObservation(payloadBytes, JsonValueKind.ARRAY, List.of(), "");
+                skipArray(1);
+                return new JsonShapeObservation(bytes.length, JsonValueKind.ARRAY, List.of());
             }
 
-            JsonValueKind rootKind = skipValue();
-            return new JsonShapeObservation(payloadBytes, rootKind, List.of(), "");
+            JsonValueKind rootKind = skipValue(1);
+            return new JsonShapeObservation(bytes.length, rootKind, List.of());
         }
 
         private List<FieldObservation> scanRootObject() {
@@ -54,11 +87,14 @@ final class JsonShapeScanner {
 
             while (!isAtEnd()) {
                 skipWhitespace();
-                String name = readString();
+                String name = readFieldName();
                 skipWhitespace();
                 expect(':');
                 skipWhitespace();
-                JsonValueKind kind = skipValue();
+                if (position >= options.maxTopLevelFields()) {
+                    throw error("Too many top-level fields");
+                }
+                JsonValueKind kind = skipValue(1);
                 fields.add(new FieldObservation(name, kind, position++));
                 skipWhitespace();
 
@@ -77,24 +113,25 @@ final class JsonShapeScanner {
             throw error("Unterminated object");
         }
 
-        private JsonValueKind skipValue() {
+        private JsonValueKind skipValue(int depth) {
+            checkDepth(depth);
             skipWhitespace();
             if (isAtEnd()) {
                 return JsonValueKind.UNKNOWN;
             }
 
-            char current = json.charAt(index);
+            int current = bytes[index] & 0xff;
             return switch (current) {
                 case '"' -> {
-                    readString();
+                    skipString();
                     yield JsonValueKind.STRING;
                 }
                 case '{' -> {
-                    skipObject();
+                    skipObject(depth);
                     yield JsonValueKind.OBJECT;
                 }
                 case '[' -> {
-                    skipArray();
+                    skipArray(depth);
                     yield JsonValueKind.ARRAY;
                 }
                 case 't', 'f' -> {
@@ -106,7 +143,7 @@ final class JsonShapeScanner {
                     yield JsonValueKind.NULL;
                 }
                 default -> {
-                    if (current == '-' || Character.isDigit(current)) {
+                    if (current == '-' || isDigit(current)) {
                         skipNumber();
                         yield JsonValueKind.NUMBER;
                     }
@@ -115,7 +152,8 @@ final class JsonShapeScanner {
             };
         }
 
-        private void skipObject() {
+        private void skipObject(int depth) {
+            checkDepth(depth);
             expect('{');
             skipWhitespace();
 
@@ -126,10 +164,10 @@ final class JsonShapeScanner {
 
             while (!isAtEnd()) {
                 skipWhitespace();
-                readString();
+                skipString();
                 skipWhitespace();
                 expect(':');
-                skipValue();
+                skipValue(depth + 1);
                 skipWhitespace();
 
                 if (peek(',')) {
@@ -147,7 +185,8 @@ final class JsonShapeScanner {
             throw error("Unterminated object");
         }
 
-        private void skipArray() {
+        private void skipArray(int depth) {
+            checkDepth(depth);
             expect('[');
             skipWhitespace();
 
@@ -157,7 +196,7 @@ final class JsonShapeScanner {
             }
 
             while (!isAtEnd()) {
-                skipValue();
+                skipValue(depth + 1);
                 skipWhitespace();
 
                 if (peek(',')) {
@@ -175,28 +214,28 @@ final class JsonShapeScanner {
             throw error("Unterminated array");
         }
 
-        private String readString() {
+        private String readFieldName() {
             expect('"');
             StringBuilder builder = null;
             int start = index;
 
             while (!isAtEnd()) {
-                char current = json.charAt(index++);
+                int current = bytes[index++] & 0xff;
                 if (current == '"') {
                     int end = index - 1;
                     if (builder == null) {
-                        return json.substring(start, end);
+                        return fieldNameResolver.resolveUnescapedFieldName(bytes, start, end);
                     }
-                    builder.append(json, start, end);
-                    return builder.toString();
+                    appendUtf8(builder, start, end);
+                    return fieldNameResolver.canonicalFieldName(builder.toString());
                 }
 
                 if (current == '\\') {
                     if (builder == null) {
                         builder = new StringBuilder();
                     }
-                    builder.append(json, start, index - 1);
-                    builder.append(readEscapedCharacter());
+                    appendUtf8(builder, start, index - 1);
+                    appendEscapedCharacter(builder);
                     start = index;
                 }
             }
@@ -204,32 +243,61 @@ final class JsonShapeScanner {
             throw error("Unterminated string");
         }
 
-        private char readEscapedCharacter() {
+        private void skipString() {
+            expect('"');
+            while (!isAtEnd()) {
+                int current = bytes[index++] & 0xff;
+                if (current == '"') {
+                    return;
+                }
+                if (current == '\\') {
+                    skipEscapedCharacter();
+                }
+            }
+
+            throw error("Unterminated string");
+        }
+
+        private void appendEscapedCharacter(StringBuilder builder) {
             if (isAtEnd()) {
                 throw error("Unterminated escape sequence");
             }
 
-            char escaped = json.charAt(index++);
-            return switch (escaped) {
-                case '"', '\\', '/' -> escaped;
-                case 'b' -> '\b';
-                case 'f' -> '\f';
-                case 'n' -> '\n';
-                case 'r' -> '\r';
-                case 't' -> '\t';
-                case 'u' -> readUnicodeEscape();
+            int escaped = bytes[index++] & 0xff;
+            switch (escaped) {
+                case '"', '\\', '/' -> builder.append((char) escaped);
+                case 'b' -> builder.append('\b');
+                case 'f' -> builder.append('\f');
+                case 'n' -> builder.append('\n');
+                case 'r' -> builder.append('\r');
+                case 't' -> builder.append('\t');
+                case 'u' -> builder.append(readUnicodeEscape());
                 default -> throw error("Invalid escape sequence");
-            };
+            }
+        }
+
+        private void skipEscapedCharacter() {
+            if (isAtEnd()) {
+                throw error("Unterminated escape sequence");
+            }
+
+            int escaped = bytes[index++] & 0xff;
+            switch (escaped) {
+                case '"', '\\', '/', 'b', 'f', 'n', 'r', 't' -> {
+                }
+                case 'u' -> skipUnicodeEscape();
+                default -> throw error("Invalid escape sequence");
+            }
         }
 
         private char readUnicodeEscape() {
-            if (index + 4 > json.length()) {
+            if (index + 4 > bytes.length) {
                 throw error("Invalid unicode escape");
             }
 
             int value = 0;
             for (int i = 0; i < 4; i++) {
-                int digit = Character.digit(json.charAt(index++), 16);
+                int digit = hexDigit(bytes[index++] & 0xff);
                 if (digit < 0) {
                     throw error("Invalid unicode escape");
                 }
@@ -238,23 +306,32 @@ final class JsonShapeScanner {
             return (char) value;
         }
 
+        private void skipUnicodeEscape() {
+            if (index + 4 > bytes.length) {
+                throw error("Invalid unicode escape");
+            }
+
+            for (int i = 0; i < 4; i++) {
+                if (hexDigit(bytes[index++] & 0xff) < 0) {
+                    throw error("Invalid unicode escape");
+                }
+            }
+        }
+
         private void skipBoolean() {
-            if (json.startsWith("true", index)) {
-                index += 4;
+            if (tryConsumeAscii("true")) {
                 return;
             }
-            if (json.startsWith("false", index)) {
-                index += 5;
+            if (tryConsumeAscii("false")) {
                 return;
             }
             throw error("Invalid boolean");
         }
 
         private void skipNull() {
-            if (!json.startsWith("null", index)) {
+            if (!tryConsumeAscii("null")) {
                 throw error("Invalid null");
             }
-            index += 4;
         }
 
         private void skipNumber() {
@@ -277,7 +354,7 @@ final class JsonShapeScanner {
 
         private void readDigits() {
             int start = index;
-            while (!isAtEnd() && Character.isDigit(json.charAt(index))) {
+            while (!isAtEnd() && isDigit(bytes[index] & 0xff)) {
                 index++;
             }
             if (start == index) {
@@ -287,7 +364,7 @@ final class JsonShapeScanner {
 
         private void skipWhitespace() {
             while (!isAtEnd()) {
-                char current = json.charAt(index);
+                int current = bytes[index] & 0xff;
                 if (current == ' ' || current == '\n' || current == '\r' || current == '\t') {
                     index++;
                     continue;
@@ -297,33 +374,68 @@ final class JsonShapeScanner {
         }
 
         private void expect(char expected) {
-            if (isAtEnd() || json.charAt(index) != expected) {
+            if (isAtEnd() || (bytes[index] & 0xff) != expected) {
                 throw error("Expected '" + expected + "'");
             }
             index++;
         }
 
         private boolean peek(char expected) {
-            return !isAtEnd() && json.charAt(index) == expected;
+            return !isAtEnd() && (bytes[index] & 0xff) == expected;
+        }
+
+        private boolean tryConsumeAscii(String value) {
+            if (index + value.length() > bytes.length) {
+                return false;
+            }
+            for (int i = 0; i < value.length(); i++) {
+                if ((bytes[index + i] & 0xff) != value.charAt(i)) {
+                    return false;
+                }
+            }
+            index += value.length();
+            return true;
+        }
+
+        private String decodeUtf8(int start, int end) {
+            return new String(bytes, start, end - start, StandardCharsets.UTF_8);
+        }
+
+        private void appendUtf8(StringBuilder builder, int start, int end) {
+            if (end > start) {
+                builder.append(decodeUtf8(start, end));
+            }
         }
 
         private boolean isAtEnd() {
-            return index >= json.length();
+            return index >= bytes.length;
+        }
+
+        private void checkDepth(int depth) {
+            if (depth > options.maxNestingDepth()) {
+                throw error("JSON nesting depth exceeded");
+            }
         }
 
         private IllegalArgumentException error(String message) {
             return new IllegalArgumentException(message + " at offset " + index);
         }
-    }
 
-    private static String signature(List<FieldObservation> fields) {
-        StringBuilder builder = new StringBuilder();
-        for (int i = 0; i < fields.size(); i++) {
-            if (i > 0) {
-                builder.append(',');
-            }
-            builder.append(fields.get(i).name());
+        private static boolean isDigit(int value) {
+            return value >= '0' && value <= '9';
         }
-        return builder.toString();
+
+        private static int hexDigit(int value) {
+            if (value >= '0' && value <= '9') {
+                return value - '0';
+            }
+            if (value >= 'a' && value <= 'f') {
+                return value - 'a' + 10;
+            }
+            if (value >= 'A' && value <= 'F') {
+                return value - 'A' + 10;
+            }
+            return -1;
+        }
     }
 }

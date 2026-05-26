@@ -9,6 +9,7 @@ public record EndpointProfileSnapshot(
     long rootObjects,
     long rootArrays,
     List<FieldProfileSnapshot> fields,
-    List<FieldOrderSnapshot> fieldOrders
+    List<FieldOrderSnapshot> fieldOrders,
+    long droppedFieldOrders
 ) {
 }

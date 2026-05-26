@@ -13,11 +13,13 @@ import org.springframework.util.StreamUtils;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Objects;
 
 public final class ProfilingJackson2HttpMessageConverter extends MappingJackson2HttpMessageConverter {
     private final JsonConversionProfiler profiler;
     private final FastJsonWriterRegistry writerRegistry;
-    private final ThreadLocal<Utf8JsonBuffer> writerBuffers = ThreadLocal.withInitial(() -> new Utf8JsonBuffer(2048));
+    private final JsonBufferFactory bufferFactory;
+    private final EndpointResolver endpointResolver;
     private volatile Class<?> cachedWriterType;
     private volatile FastJsonBufferWriter<?> cachedWriter;
     private volatile Class<?> cachedMissingWriterType;
@@ -30,8 +32,27 @@ public final class ProfilingJackson2HttpMessageConverter extends MappingJackson2
         JsonConversionProfiler profiler,
         FastJsonWriterRegistry writerRegistry
     ) {
+        this(profiler, writerRegistry, JsonBufferFactory.defaultFactory());
+    }
+
+    public ProfilingJackson2HttpMessageConverter(
+        JsonConversionProfiler profiler,
+        FastJsonWriterRegistry writerRegistry,
+        JsonBufferFactory bufferFactory
+    ) {
+        this(profiler, writerRegistry, bufferFactory, EndpointResolver.unknown());
+    }
+
+    public ProfilingJackson2HttpMessageConverter(
+        JsonConversionProfiler profiler,
+        FastJsonWriterRegistry writerRegistry,
+        JsonBufferFactory bufferFactory,
+        EndpointResolver endpointResolver
+    ) {
         this.profiler = profiler;
         this.writerRegistry = writerRegistry;
+        this.bufferFactory = Objects.requireNonNull(bufferFactory, "bufferFactory");
+        this.endpointResolver = Objects.requireNonNull(endpointResolver, "endpointResolver");
     }
 
     public ProfilingJackson2HttpMessageConverter(ObjectMapper objectMapper, JsonConversionProfiler profiler) {
@@ -43,9 +64,30 @@ public final class ProfilingJackson2HttpMessageConverter extends MappingJackson2
         JsonConversionProfiler profiler,
         FastJsonWriterRegistry writerRegistry
     ) {
+        this(objectMapper, profiler, writerRegistry, JsonBufferFactory.defaultFactory());
+    }
+
+    public ProfilingJackson2HttpMessageConverter(
+        ObjectMapper objectMapper,
+        JsonConversionProfiler profiler,
+        FastJsonWriterRegistry writerRegistry,
+        JsonBufferFactory bufferFactory
+    ) {
+        this(objectMapper, profiler, writerRegistry, bufferFactory, EndpointResolver.unknown());
+    }
+
+    public ProfilingJackson2HttpMessageConverter(
+        ObjectMapper objectMapper,
+        JsonConversionProfiler profiler,
+        FastJsonWriterRegistry writerRegistry,
+        JsonBufferFactory bufferFactory,
+        EndpointResolver endpointResolver
+    ) {
         super(objectMapper);
         this.profiler = profiler;
         this.writerRegistry = writerRegistry;
+        this.bufferFactory = Objects.requireNonNull(bufferFactory, "bufferFactory");
+        this.endpointResolver = Objects.requireNonNull(endpointResolver, "endpointResolver");
     }
 
     @Override
@@ -59,7 +101,7 @@ public final class ProfilingJackson2HttpMessageConverter extends MappingJackson2
         long elapsed = System.nanoTime() - start;
 
         profiler.record(new ConversionRoute(
-            JsonFastlaneSpring.currentEndpoint(),
+            endpointResolver.resolveRead(inputMessage),
             ConversionDirection.READ,
             clazz.getName()
         ), body, elapsed);
@@ -84,7 +126,7 @@ public final class ProfilingJackson2HttpMessageConverter extends MappingJackson2
         outputMessage.getBody().write(body);
 
         profiler.record(new ConversionRoute(
-            JsonFastlaneSpring.currentEndpoint(),
+            endpointResolver.resolveWrite(outputMessage),
             ConversionDirection.WRITE,
             object == null ? "null" : object.getClass().getName()
         ), body, elapsed);
@@ -107,7 +149,7 @@ public final class ProfilingJackson2HttpMessageConverter extends MappingJackson2
             return false;
         }
 
-        Utf8JsonBuffer out = writerBuffers.get().reset();
+        Utf8JsonBuffer out = bufferFactory.create();
         long start = System.nanoTime();
         writer.write(object, out);
         long elapsed = System.nanoTime() - start;
@@ -119,7 +161,7 @@ public final class ProfilingJackson2HttpMessageConverter extends MappingJackson2
         out.writeTo(outputMessage.getBody());
 
         profiler.recordConversion(new ConversionRoute(
-            JsonFastlaneSpring.currentEndpoint(),
+            endpointResolver.resolveWrite(outputMessage),
             ConversionDirection.WRITE,
             objectType.getName()
         ), out.size(), elapsed);

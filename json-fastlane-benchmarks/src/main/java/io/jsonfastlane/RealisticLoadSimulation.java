@@ -2,12 +2,21 @@ package io.jsonfastlane;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.jsonfastlane.netty.NettyJsonSink;
 import io.jsonfastlane.spring.ConversionProfileSnapshot;
+import io.jsonfastlane.spring.EndpointResolver;
 import io.jsonfastlane.spring.FastJsonHttpMessageConverter;
+import io.jsonfastlane.spring.FastJsonTransportHttpMessageConverter;
 import io.jsonfastlane.spring.FastJsonWriterRegistry;
+import io.jsonfastlane.spring.JsonBufferFactory;
 import io.jsonfastlane.spring.JsonConversionProfiler;
-import io.jsonfastlane.spring.JsonFastlaneSpring;
 import io.jsonfastlane.spring.ProfilingJackson2HttpMessageConverter;
+import io.jsonfastlane.transport.JsonSegment;
+import io.jsonfastlane.transport.JsonSink;
+import io.jsonfastlane.transport.TransportJsonWriter;
+import io.jsonfastlane.transport.Utf8JsonSink;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpInputMessage;
 import org.springframework.http.HttpOutputMessage;
@@ -18,6 +27,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -25,6 +35,7 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -33,6 +44,8 @@ import java.util.concurrent.TimeUnit;
 public final class RealisticLoadSimulation {
     private static final String CHECKOUT_ENDPOINT = "/checkout";
     private static final String SUMMARY_ENDPOINT = "/orders/{id}/summary";
+    private static final String ENDPOINT_HEADER = "X-JsonFastlane-Endpoint";
+    private static final com.sun.management.ThreadMXBean THREAD_ALLOCATIONS = threadAllocationBean();
     private static volatile long blackhole;
 
     private RealisticLoadSimulation() {
@@ -46,8 +59,15 @@ public final class RealisticLoadSimulation {
         MappingJackson2HttpMessageConverter springDefaultConverter =
             new MappingJackson2HttpMessageConverter(objectMapper);
         JsonConversionProfiler profiler = new JsonConversionProfiler();
+        EndpointResolver endpointResolver = EndpointResolver.fromHeader(ENDPOINT_HEADER);
         ProfilingJackson2HttpMessageConverter converter =
-            new ProfilingJackson2HttpMessageConverter(objectMapper, profiler);
+            new ProfilingJackson2HttpMessageConverter(
+                objectMapper,
+                profiler,
+                new FastJsonWriterRegistry(),
+                JsonBufferFactory.defaultFactory(),
+                endpointResolver
+            );
         FastJsonWriterRegistry writerRegistry = new FastJsonWriterRegistry();
 
         CheckoutRequest request = checkoutRequest();
@@ -76,32 +96,63 @@ public final class RealisticLoadSimulation {
         );
         OrderSummaryResponseWriter fastWriter = new OrderSummaryResponseWriter();
         writerRegistry.register(OrderSummaryResponse.class, fastWriter);
-        ThreadLocal<Utf8JsonBuffer> reusableWriterBuffer =
-            ThreadLocal.withInitial(() -> new Utf8JsonBuffer(jacksonResponseBytesCapacityHint()));
+        ConcurrentLinkedQueue<Utf8JsonBuffer> reusableWriterBuffers = new ConcurrentLinkedQueue<>();
+        ConcurrentLinkedQueue<Utf8JsonBuffer> reusableTransportBuffers = new ConcurrentLinkedQueue<>();
+        ConcurrentLinkedQueue<ByteBuf> reusableNettyTransportBuffers = new ConcurrentLinkedQueue<>();
 
         byte[] requestBytes = objectMapper.writeValueAsBytes(request);
         byte[] shuffledRequestBytes = shuffledCheckoutRequestJson().getBytes(StandardCharsets.UTF_8);
         byte[] jacksonResponseBytes = objectMapper.writeValueAsBytes(response);
         byte[] fastResponseBytes = fastWriter.write(response);
-        SimpleOutputMessage directOutput = new SimpleOutputMessage();
+        Utf8JsonBuffer transportResponseBuffer = new Utf8JsonBuffer(jacksonResponseBytesCapacityHint());
+        fastWriter.write(response, new Utf8JsonSink(transportResponseBuffer));
+        ByteBuf transportByteBuf = Unpooled.buffer(jacksonResponseBytesCapacityHint());
+        try {
+            fastWriter.write(response, new NettyJsonSink(transportByteBuf));
+            assertSameJson(objectMapper, jacksonResponseBytes, byteBufBytes(transportByteBuf));
+        } finally {
+            transportByteBuf.release();
+        }
+        SimpleOutputMessage directOutput = new SimpleOutputMessage(SUMMARY_ENDPOINT);
         new ProfilingJackson2HttpMessageConverter(
             objectMapper,
             new JsonConversionProfiler(),
-            writerRegistry
+            writerRegistry,
+            JsonBufferFactory.defaultFactory(),
+            endpointResolver
         ).write(response, MediaType.APPLICATION_JSON, directOutput);
         CheckoutRequest fastRequest = fastReader.read(requestBytes);
         if (!request.equals(fastRequest)) {
             throw new AssertionError("Generated reader did not produce an equivalent request.");
         }
         assertSameJson(objectMapper, jacksonResponseBytes, fastResponseBytes);
+        assertSameJson(objectMapper, jacksonResponseBytes, transportResponseBuffer.toByteArray());
         assertSameJson(objectMapper, jacksonResponseBytes, directOutput.bytes());
 
         JsonConversionProfiler directWriterProfiler = new JsonConversionProfiler();
         ProfilingJackson2HttpMessageConverter directWriterConverter =
-            new ProfilingJackson2HttpMessageConverter(objectMapper, directWriterProfiler, writerRegistry);
+            new ProfilingJackson2HttpMessageConverter(
+                objectMapper,
+                directWriterProfiler,
+                writerRegistry,
+                JsonBufferFactory.defaultFactory(),
+                endpointResolver
+            );
         JsonConversionProfiler dedicatedWriterProfiler = new JsonConversionProfiler();
         FastJsonHttpMessageConverter dedicatedWriterConverter =
-            new FastJsonHttpMessageConverter(dedicatedWriterProfiler, writerRegistry);
+            new FastJsonHttpMessageConverter(
+                dedicatedWriterProfiler,
+                writerRegistry,
+                JsonBufferFactory.defaultFactory(),
+                endpointResolver
+            );
+        JsonConversionProfiler transportWriterProfiler = new JsonConversionProfiler();
+        FastJsonTransportHttpMessageConverter transportWriterConverter =
+            new FastJsonTransportHttpMessageConverter(
+                transportWriterProfiler,
+                writerRegistry,
+                endpointResolver
+            );
 
         System.out.println("json-fastlane realistic load simulation");
         System.out.println("threads=" + threads + " iterationsPerThread=" + iterationsPerThread);
@@ -114,12 +165,8 @@ public final class RealisticLoadSimulation {
                 objectMapper.readValue(requestBytes, CheckoutRequest.class)),
             new Scenario("spring-default-read-checkout", () ->
                 springDefaultConverter.read(CheckoutRequest.class, new SimpleInputMessage(requestBytes))),
-            new Scenario("profiling-converter-read-checkout", () -> {
-                try (JsonFastlaneSpring.EndpointScope ignored =
-                         JsonFastlaneSpring.withCurrentEndpoint(CHECKOUT_ENDPOINT)) {
-                    return converter.read(CheckoutRequest.class, new SimpleInputMessage(requestBytes));
-                }
-            }),
+            new Scenario("profiling-converter-read-checkout", () ->
+                converter.read(CheckoutRequest.class, new SimpleInputMessage(requestBytes, CHECKOUT_ENDPOINT))),
             new Scenario("fastlane-generated-read-checkout", () ->
                 fastReader.read(requestBytes)),
             new Scenario("fastlane-fallback-read-shuffled", () ->
@@ -134,43 +181,64 @@ public final class RealisticLoadSimulation {
                 return output;
             }),
             new Scenario("profiling-converter-write-summary", () -> {
-                try (JsonFastlaneSpring.EndpointScope ignored =
-                         JsonFastlaneSpring.withCurrentEndpoint(SUMMARY_ENDPOINT)) {
-                    SimpleOutputMessage output = new SimpleOutputMessage();
-                    converter.write(response, MediaType.APPLICATION_JSON, output);
-                    return output.bytes();
-                }
+                SimpleOutputMessage output = new SimpleOutputMessage(SUMMARY_ENDPOINT);
+                converter.write(response, MediaType.APPLICATION_JSON, output);
+                return output.bytes();
             }),
             new Scenario("fastlane-generated-write-summary", () ->
                 fastWriter.write(response)),
             new Scenario("fastlane-reused-buffer-write-summary", () -> {
-                Utf8JsonBuffer out = reusableWriterBuffer.get().reset();
+                Utf8JsonBuffer out = reusableWriterBuffers.poll();
+                if (out == null) {
+                    out = new Utf8JsonBuffer(jacksonResponseBytesCapacityHint());
+                }
+                out.reset();
                 fastWriter.write(response, out);
-                return out;
+                BufferSample sample = new BufferSample(out.size(), out.firstByte(), out.lastByte());
+                reusableWriterBuffers.offer(out);
+                return sample;
+            }),
+            new Scenario("fastlane-transport-utf8-sink-summary", () -> {
+                Utf8JsonBuffer out = reusableTransportBuffers.poll();
+                if (out == null) {
+                    out = new Utf8JsonBuffer(jacksonResponseBytesCapacityHint());
+                }
+                out.reset();
+                fastWriter.write(response, new Utf8JsonSink(out));
+                BufferSample sample = new BufferSample(out.size(), out.firstByte(), out.lastByte());
+                reusableTransportBuffers.offer(out);
+                return sample;
+            }),
+            new Scenario("fastlane-transport-netty-sink-summary", () -> {
+                ByteBuf out = reusableNettyTransportBuffers.poll();
+                if (out == null) {
+                    out = Unpooled.buffer(jacksonResponseBytesCapacityHint());
+                }
+                out.clear();
+                fastWriter.write(response, new NettyJsonSink(out));
+                BufferSample sample = byteBufSample(out);
+                reusableNettyTransportBuffers.offer(out);
+                return sample;
             }),
             new Scenario("fastlane-spring-direct-write-summary", () -> {
-                try (JsonFastlaneSpring.EndpointScope ignored =
-                         JsonFastlaneSpring.withCurrentEndpoint(SUMMARY_ENDPOINT)) {
-                    SimpleOutputMessage output = new SimpleOutputMessage();
-                    directWriterConverter.write(response, MediaType.APPLICATION_JSON, output);
-                    return output;
-                }
+                SimpleOutputMessage output = new SimpleOutputMessage(SUMMARY_ENDPOINT);
+                directWriterConverter.write(response, MediaType.APPLICATION_JSON, output);
+                return output;
             }),
             new Scenario("fastlane-spring-direct-sink-summary", () -> {
-                try (JsonFastlaneSpring.EndpointScope ignored =
-                         JsonFastlaneSpring.withCurrentEndpoint(SUMMARY_ENDPOINT)) {
-                    SinkOutputMessage output = new SinkOutputMessage();
-                    directWriterConverter.write(response, MediaType.APPLICATION_JSON, output);
-                    return output;
-                }
+                SinkOutputMessage output = new SinkOutputMessage(SUMMARY_ENDPOINT);
+                directWriterConverter.write(response, MediaType.APPLICATION_JSON, output);
+                return output;
             }),
             new Scenario("fastlane-dedicated-sink-summary", () -> {
-                try (JsonFastlaneSpring.EndpointScope ignored =
-                         JsonFastlaneSpring.withCurrentEndpoint(SUMMARY_ENDPOINT)) {
-                    SinkOutputMessage output = new SinkOutputMessage();
-                    dedicatedWriterConverter.write(response, MediaType.APPLICATION_JSON, output);
-                    return output;
-                }
+                SinkOutputMessage output = new SinkOutputMessage(SUMMARY_ENDPOINT);
+                dedicatedWriterConverter.write(response, MediaType.APPLICATION_JSON, output);
+                return output;
+            }),
+            new Scenario("fastlane-spring-transport-summary", () -> {
+                SinkOutputMessage output = new SinkOutputMessage(SUMMARY_ENDPOINT);
+                transportWriterConverter.write(response, MediaType.APPLICATION_JSON, output);
+                return output;
             })
         );
 
@@ -189,6 +257,7 @@ public final class RealisticLoadSimulation {
         printProfilerSnapshots(profiler);
         printProfilerSnapshots("Spring direct writer profiler snapshots", directWriterProfiler);
         printProfilerSnapshots("Dedicated fast writer profiler snapshots", dedicatedWriterProfiler);
+        printProfilerSnapshots("Spring transport writer profiler snapshots", transportWriterProfiler);
         printShapeSnapshots(profiler);
     }
 
@@ -202,19 +271,28 @@ public final class RealisticLoadSimulation {
         throws Exception {
         int totalOperations = threads * iterationsPerThread;
         long[] latencies = new long[totalOperations];
+        long[] allocatedBytes = new long[threads];
         CountDownLatch start = new CountDownLatch(1);
         ExecutorService executor = Executors.newFixedThreadPool(threads);
 
         for (int worker = 0; worker < threads; worker++) {
+            int workerIndex = worker;
             int offset = worker * iterationsPerThread;
             executor.submit(() -> {
                 try {
                     start.await();
+                    long allocatedBefore = currentThreadAllocatedBytes();
                     for (int i = 0; i < iterationsPerThread; i++) {
                         long begin = System.nanoTime();
                         Object result = scenario.operation().run();
                         latencies[offset + i] = System.nanoTime() - begin;
                         consume(result);
+                    }
+                    long allocatedAfter = currentThreadAllocatedBytes();
+                    if (allocatedBefore >= 0 && allocatedAfter >= allocatedBefore) {
+                        allocatedBytes[workerIndex] = allocatedAfter - allocatedBefore;
+                    } else {
+                        allocatedBytes[workerIndex] = -1;
                     }
                 } catch (Exception exception) {
                     throw new RuntimeException(exception);
@@ -238,7 +316,8 @@ public final class RealisticLoadSimulation {
             elapsed,
             percentile(latencies, 0.50),
             percentile(latencies, 0.95),
-            percentile(latencies, 0.99)
+            percentile(latencies, 0.99),
+            totalAllocatedBytes(allocatedBytes)
         );
     }
 
@@ -248,15 +327,16 @@ public final class RealisticLoadSimulation {
     }
 
     private static void printResults(List<ScenarioResult> results) {
-        System.out.printf("%-38s %12s %12s %12s %12s%n",
-            "scenario", "ops/s", "p50 us", "p95 us", "p99 us");
+        System.out.printf("%-38s %12s %12s %12s %12s %12s%n",
+            "scenario", "ops/s", "p50 us", "p95 us", "p99 us", "alloc/op");
         for (ScenarioResult result : results) {
-            System.out.printf(Locale.ROOT, "%-38s %12.0f %12.2f %12.2f %12.2f%n",
+            System.out.printf(Locale.ROOT, "%-38s %12.0f %12.2f %12.2f %12.2f %12s%n",
                 result.name(),
                 result.operationsPerSecond(),
                 result.p50Nanos() / 1_000.0,
                 result.p95Nanos() / 1_000.0,
-                result.p99Nanos() / 1_000.0);
+                result.p99Nanos() / 1_000.0,
+                result.allocationPerOperationLabel());
         }
         System.out.println();
 
@@ -264,9 +344,12 @@ public final class RealisticLoadSimulation {
         ScenarioResult springDefaultWrite = find(results, "spring-default-write-summary");
         ScenarioResult fastWrite = find(results, "fastlane-generated-write-summary");
         ScenarioResult reusedFastWrite = find(results, "fastlane-reused-buffer-write-summary");
+        ScenarioResult transportUtf8Sink = find(results, "fastlane-transport-utf8-sink-summary");
+        ScenarioResult transportNettySink = find(results, "fastlane-transport-netty-sink-summary");
         ScenarioResult springDirectWrite = find(results, "fastlane-spring-direct-write-summary");
         ScenarioResult springDirectSink = find(results, "fastlane-spring-direct-sink-summary");
         ScenarioResult dedicatedSink = find(results, "fastlane-dedicated-sink-summary");
+        ScenarioResult springTransport = find(results, "fastlane-spring-transport-summary");
         ScenarioResult jacksonRead = find(results, "jackson-read-checkout");
         ScenarioResult springDefaultRead = find(results, "spring-default-read-checkout");
         ScenarioResult fastRead = find(results, "fastlane-generated-read-checkout");
@@ -276,8 +359,16 @@ public final class RealisticLoadSimulation {
             fastRead.operationsPerSecond() / springDefaultRead.operationsPerSecond());
         System.out.printf(Locale.ROOT, "generated writer throughput ratio vs Jackson: %.2fx%n",
             fastWrite.operationsPerSecond() / jacksonWrite.operationsPerSecond());
+        System.out.printf(Locale.ROOT, "transport UTF-8 sink throughput ratio vs Jackson: %.2fx%n",
+            transportUtf8Sink.operationsPerSecond() / jacksonWrite.operationsPerSecond());
+        System.out.printf(Locale.ROOT, "transport UTF-8 sink throughput ratio vs reused buffer: %.2fx%n",
+            transportUtf8Sink.operationsPerSecond() / reusedFastWrite.operationsPerSecond());
+        System.out.printf(Locale.ROOT, "transport Netty sink throughput ratio vs Jackson: %.2fx%n",
+            transportNettySink.operationsPerSecond() / jacksonWrite.operationsPerSecond());
         System.out.printf(Locale.ROOT, "dedicated converter sink throughput ratio vs Spring default: %.2fx%n",
             dedicatedSink.operationsPerSecond() / springDefaultWrite.operationsPerSecond());
+        System.out.printf(Locale.ROOT, "transport converter throughput ratio vs Spring default: %.2fx%n",
+            springTransport.operationsPerSecond() / springDefaultWrite.operationsPerSecond());
         System.out.printf(Locale.ROOT, "reused-buffer writer throughput ratio vs Jackson: %.2fx%n",
             reusedFastWrite.operationsPerSecond() / jacksonWrite.operationsPerSecond());
         System.out.printf(Locale.ROOT, "Spring direct writer throughput ratio vs Jackson: %.2fx%n",
@@ -304,6 +395,10 @@ public final class RealisticLoadSimulation {
             blackhole ^= bytes[0];
             blackhole ^= bytes[bytes.length - 1];
         } else if (value instanceof Utf8JsonBuffer buffer) {
+            blackhole ^= buffer.size();
+            blackhole ^= buffer.firstByte();
+            blackhole ^= buffer.lastByte();
+        } else if (value instanceof BufferSample buffer) {
             blackhole ^= buffer.size();
             blackhole ^= buffer.firstByte();
             blackhole ^= buffer.lastByte();
@@ -357,6 +452,9 @@ public final class RealisticLoadSimulation {
                 snapshot.averagePayloadBytes());
             snapshot.fieldOrders().stream().limit(1).forEach(order ->
                 System.out.println("  commonOrder=" + order.signature() + " samples=" + order.samples()));
+            if (snapshot.droppedFieldOrders() > 0) {
+                System.out.println("  droppedFieldOrders=" + snapshot.droppedFieldOrders());
+            }
             snapshot.fields().stream()
                 .sorted(Comparator.comparing(FieldProfileSnapshot::averagePosition))
                 .forEach(field -> System.out.println("  field=" + field.name()
@@ -378,6 +476,38 @@ public final class RealisticLoadSimulation {
         return Integer.parseInt(value);
     }
 
+    private static long totalAllocatedBytes(long[] workerAllocatedBytes) {
+        if (THREAD_ALLOCATIONS == null) {
+            return -1;
+        }
+
+        long total = 0;
+        for (long value : workerAllocatedBytes) {
+            if (value < 0) {
+                return -1;
+            }
+            total += value;
+        }
+        return total;
+    }
+
+    private static long currentThreadAllocatedBytes() {
+        if (THREAD_ALLOCATIONS == null) {
+            return -1;
+        }
+        return THREAD_ALLOCATIONS.getThreadAllocatedBytes(Thread.currentThread().getId());
+    }
+
+    private static com.sun.management.ThreadMXBean threadAllocationBean() {
+        java.lang.management.ThreadMXBean bean = ManagementFactory.getThreadMXBean();
+        if (bean instanceof com.sun.management.ThreadMXBean allocationBean
+            && allocationBean.isThreadAllocatedMemorySupported()) {
+            allocationBean.setThreadAllocatedMemoryEnabled(true);
+            return allocationBean;
+        }
+        return null;
+    }
+
     private static int jacksonResponseBytesCapacityHint() {
         return 2048;
     }
@@ -390,6 +520,21 @@ public final class RealisticLoadSimulation {
                 + new String(left, StandardCharsets.UTF_8)
                 + "\nFastlane=" + new String(right, StandardCharsets.UTF_8));
         }
+    }
+
+    private static byte[] byteBufBytes(ByteBuf byteBuf) {
+        byte[] bytes = new byte[byteBuf.readableBytes()];
+        byteBuf.getBytes(byteBuf.readerIndex(), bytes);
+        return bytes;
+    }
+
+    private static BufferSample byteBufSample(ByteBuf byteBuf) {
+        int size = byteBuf.readableBytes();
+        if (size == 0) {
+            return new BufferSample(0, (byte) 0, (byte) 0);
+        }
+        int firstIndex = byteBuf.readerIndex();
+        return new BufferSample(size, byteBuf.getByte(firstIndex), byteBuf.getByte(firstIndex + size - 1));
     }
 
     private static CheckoutRequest checkoutRequest() {
@@ -447,16 +592,27 @@ public final class RealisticLoadSimulation {
     private record Scenario(String name, ThrowingOperation operation) {
     }
 
+    private record BufferSample(int size, byte firstByte, byte lastByte) {
+    }
+
     private record ScenarioResult(
         String name,
         long operations,
         long elapsedNanos,
         long p50Nanos,
         long p95Nanos,
-        long p99Nanos
+        long p99Nanos,
+        long allocatedBytes
     ) {
         private double operationsPerSecond() {
             return operations / (elapsedNanos / 1_000_000_000.0);
+        }
+
+        private String allocationPerOperationLabel() {
+            if (allocatedBytes < 0) {
+                return "n/a";
+            }
+            return String.format(Locale.ROOT, "%.0f B", allocatedBytes / (double) operations);
         }
     }
 
@@ -909,35 +1065,37 @@ public final class RealisticLoadSimulation {
     }
 
     private static final class OrderSummaryResponseWriter
-        implements FastJsonWriter<OrderSummaryResponse>, FastJsonBufferWriter<OrderSummaryResponse> {
-        private static final byte[] ORDER_ID = ascii("{\"orderId\":");
-        private static final byte[] STATUS = ascii(",\"status\":");
-        private static final byte[] USER_ID = ascii(",\"userId\":");
-        private static final byte[] EMAIL = ascii(",\"email\":");
-        private static final byte[] CREATED_AT = ascii(",\"createdAt\":");
-        private static final byte[] LINES = ascii(",\"lines\":[");
-        private static final byte[] SHIPPING_ADDRESS = ascii(",\"shippingAddress\":");
-        private static final byte[] PAYMENT = ascii(",\"payment\":");
-        private static final byte[] TIMELINE = ascii(",\"timeline\":[");
-        private static final byte[] DELIVERY_MEMO = ascii(",\"deliveryMemo\":");
-        private static final byte[] SKU = ascii("{\"sku\":");
-        private static final byte[] NAME = ascii(",\"name\":");
-        private static final byte[] QUANTITY = ascii(",\"quantity\":");
-        private static final byte[] UNIT_PRICE_CENTS = ascii(",\"unitPriceCents\":");
-        private static final byte[] DISCOUNTED = ascii(",\"discounted\":");
-        private static final byte[] COUNTRY = ascii("{\"country\":");
-        private static final byte[] CITY = ascii(",\"city\":");
-        private static final byte[] LINE_1 = ascii(",\"line1\":");
-        private static final byte[] LINE_2 = ascii(",\"line2\":");
-        private static final byte[] POSTAL_CODE = ascii(",\"postalCode\":");
-        private static final byte[] METHOD = ascii("{\"method\":");
-        private static final byte[] CURRENCY = ascii(",\"currency\":");
-        private static final byte[] SUBTOTAL_CENTS = ascii(",\"subtotalCents\":");
-        private static final byte[] DISCOUNT_CENTS = ascii(",\"discountCents\":");
-        private static final byte[] SHIPPING_CENTS = ascii(",\"shippingCents\":");
-        private static final byte[] TOTAL_CENTS = ascii(",\"totalCents\":");
-        private static final byte[] TIMELINE_STATUS = ascii("{\"status\":");
-        private static final byte[] AT = ascii(",\"at\":");
+        implements FastJsonWriter<OrderSummaryResponse>,
+        FastJsonBufferWriter<OrderSummaryResponse>,
+        TransportJsonWriter<OrderSummaryResponse> {
+        private static final JsonSegment ORDER_ID = JsonSegment.ascii("{\"orderId\":");
+        private static final JsonSegment STATUS = JsonSegment.ascii(",\"status\":");
+        private static final JsonSegment USER_ID = JsonSegment.ascii(",\"userId\":");
+        private static final JsonSegment EMAIL = JsonSegment.ascii(",\"email\":");
+        private static final JsonSegment CREATED_AT = JsonSegment.ascii(",\"createdAt\":");
+        private static final JsonSegment LINES = JsonSegment.ascii(",\"lines\":[");
+        private static final JsonSegment SHIPPING_ADDRESS = JsonSegment.ascii(",\"shippingAddress\":");
+        private static final JsonSegment PAYMENT = JsonSegment.ascii(",\"payment\":");
+        private static final JsonSegment TIMELINE = JsonSegment.ascii(",\"timeline\":[");
+        private static final JsonSegment DELIVERY_MEMO = JsonSegment.ascii(",\"deliveryMemo\":");
+        private static final JsonSegment SKU = JsonSegment.ascii("{\"sku\":");
+        private static final JsonSegment NAME = JsonSegment.ascii(",\"name\":");
+        private static final JsonSegment QUANTITY = JsonSegment.ascii(",\"quantity\":");
+        private static final JsonSegment UNIT_PRICE_CENTS = JsonSegment.ascii(",\"unitPriceCents\":");
+        private static final JsonSegment DISCOUNTED = JsonSegment.ascii(",\"discounted\":");
+        private static final JsonSegment COUNTRY = JsonSegment.ascii("{\"country\":");
+        private static final JsonSegment CITY = JsonSegment.ascii(",\"city\":");
+        private static final JsonSegment LINE_1 = JsonSegment.ascii(",\"line1\":");
+        private static final JsonSegment LINE_2 = JsonSegment.ascii(",\"line2\":");
+        private static final JsonSegment POSTAL_CODE = JsonSegment.ascii(",\"postalCode\":");
+        private static final JsonSegment METHOD = JsonSegment.ascii("{\"method\":");
+        private static final JsonSegment CURRENCY = JsonSegment.ascii(",\"currency\":");
+        private static final JsonSegment SUBTOTAL_CENTS = JsonSegment.ascii(",\"subtotalCents\":");
+        private static final JsonSegment DISCOUNT_CENTS = JsonSegment.ascii(",\"discountCents\":");
+        private static final JsonSegment SHIPPING_CENTS = JsonSegment.ascii(",\"shippingCents\":");
+        private static final JsonSegment TOTAL_CENTS = JsonSegment.ascii(",\"totalCents\":");
+        private static final JsonSegment TIMELINE_STATUS = JsonSegment.ascii("{\"status\":");
+        private static final JsonSegment AT = JsonSegment.ascii(",\"at\":");
 
         @Override
         public byte[] write(OrderSummaryResponse value) {
@@ -948,12 +1106,12 @@ public final class RealisticLoadSimulation {
 
         @Override
         public void write(OrderSummaryResponse value, Utf8JsonBuffer out) {
-            out.writeRaw(ORDER_ID).writeLong(value.orderId());
-            out.writeRaw(STATUS).writeString(value.status());
-            out.writeRaw(USER_ID).writeLong(value.userId());
-            out.writeRaw(EMAIL).writeString(value.email());
-            out.writeRaw(CREATED_AT).writeString(value.createdAt());
-            out.writeRaw(LINES);
+            out.writeSegment(ORDER_ID).writeLong(value.orderId());
+            out.writeSegment(STATUS).writeString(value.status());
+            out.writeSegment(USER_ID).writeLong(value.userId());
+            out.writeSegment(EMAIL).writeString(value.email());
+            out.writeSegment(CREATED_AT).writeString(value.createdAt());
+            out.writeSegment(LINES);
             for (int i = 0; i < value.lines().size(); i++) {
                 if (i > 0) {
                     out.writeByte(',');
@@ -961,11 +1119,11 @@ public final class RealisticLoadSimulation {
                 writeLine(out, value.lines().get(i));
             }
             out.writeByte(']');
-            out.writeRaw(SHIPPING_ADDRESS);
+            out.writeSegment(SHIPPING_ADDRESS);
             writeAddress(out, value.shippingAddress());
-            out.writeRaw(PAYMENT);
+            out.writeSegment(PAYMENT);
             writePayment(out, value.payment());
-            out.writeRaw(TIMELINE);
+            out.writeSegment(TIMELINE);
             for (int i = 0; i < value.timeline().size(); i++) {
                 if (i > 0) {
                     out.writeByte(',');
@@ -973,46 +1131,107 @@ public final class RealisticLoadSimulation {
                 writeTimeline(out, value.timeline().get(i));
             }
             out.writeByte(']');
-            out.writeRaw(DELIVERY_MEMO).writeString(value.deliveryMemo());
+            out.writeSegment(DELIVERY_MEMO).writeString(value.deliveryMemo());
             out.writeByte('}');
         }
 
+        @Override
+        public void write(OrderSummaryResponse value, JsonSink sink) {
+            sink.writeSegment(ORDER_ID).writeLong(value.orderId());
+            sink.writeSegment(STATUS).writeString(value.status());
+            sink.writeSegment(USER_ID).writeLong(value.userId());
+            sink.writeSegment(EMAIL).writeString(value.email());
+            sink.writeSegment(CREATED_AT).writeString(value.createdAt());
+            sink.writeSegment(LINES);
+            for (int i = 0; i < value.lines().size(); i++) {
+                if (i > 0) {
+                    sink.writeByte(',');
+                }
+                writeLine(sink, value.lines().get(i));
+            }
+            sink.writeByte(']');
+            sink.writeSegment(SHIPPING_ADDRESS);
+            writeAddress(sink, value.shippingAddress());
+            sink.writeSegment(PAYMENT);
+            writePayment(sink, value.payment());
+            sink.writeSegment(TIMELINE);
+            for (int i = 0; i < value.timeline().size(); i++) {
+                if (i > 0) {
+                    sink.writeByte(',');
+                }
+                writeTimeline(sink, value.timeline().get(i));
+            }
+            sink.writeByte(']');
+            sink.writeSegment(DELIVERY_MEMO).writeString(value.deliveryMemo());
+            sink.writeByte('}');
+        }
+
         private static void writeLine(Utf8JsonBuffer out, OrderLine line) {
-            out.writeRaw(SKU).writeString(line.sku());
-            out.writeRaw(NAME).writeString(line.name());
-            out.writeRaw(QUANTITY).writeInt(line.quantity());
-            out.writeRaw(UNIT_PRICE_CENTS).writeLong(line.unitPriceCents());
-            out.writeRaw(DISCOUNTED).writeBoolean(line.discounted());
+            out.writeSegment(SKU).writeString(line.sku());
+            out.writeSegment(NAME).writeString(line.name());
+            out.writeSegment(QUANTITY).writeInt(line.quantity());
+            out.writeSegment(UNIT_PRICE_CENTS).writeLong(line.unitPriceCents());
+            out.writeSegment(DISCOUNTED).writeBoolean(line.discounted());
             out.writeByte('}');
         }
 
         private static void writeAddress(Utf8JsonBuffer out, ShippingAddress address) {
-            out.writeRaw(COUNTRY).writeString(address.country());
-            out.writeRaw(CITY).writeString(address.city());
-            out.writeRaw(LINE_1).writeString(address.line1());
-            out.writeRaw(LINE_2).writeString(address.line2());
-            out.writeRaw(POSTAL_CODE).writeString(address.postalCode());
+            out.writeSegment(COUNTRY).writeString(address.country());
+            out.writeSegment(CITY).writeString(address.city());
+            out.writeSegment(LINE_1).writeString(address.line1());
+            out.writeSegment(LINE_2).writeString(address.line2());
+            out.writeSegment(POSTAL_CODE).writeString(address.postalCode());
             out.writeByte('}');
         }
 
         private static void writePayment(Utf8JsonBuffer out, PaymentSummary payment) {
-            out.writeRaw(METHOD).writeString(payment.method());
-            out.writeRaw(CURRENCY).writeString(payment.currency());
-            out.writeRaw(SUBTOTAL_CENTS).writeLong(payment.subtotalCents());
-            out.writeRaw(DISCOUNT_CENTS).writeLong(payment.discountCents());
-            out.writeRaw(SHIPPING_CENTS).writeLong(payment.shippingCents());
-            out.writeRaw(TOTAL_CENTS).writeLong(payment.totalCents());
+            out.writeSegment(METHOD).writeString(payment.method());
+            out.writeSegment(CURRENCY).writeString(payment.currency());
+            out.writeSegment(SUBTOTAL_CENTS).writeLong(payment.subtotalCents());
+            out.writeSegment(DISCOUNT_CENTS).writeLong(payment.discountCents());
+            out.writeSegment(SHIPPING_CENTS).writeLong(payment.shippingCents());
+            out.writeSegment(TOTAL_CENTS).writeLong(payment.totalCents());
             out.writeByte('}');
         }
 
         private static void writeTimeline(Utf8JsonBuffer out, TimelineEvent event) {
-            out.writeRaw(TIMELINE_STATUS).writeString(event.status());
-            out.writeRaw(AT).writeString(event.at());
+            out.writeSegment(TIMELINE_STATUS).writeString(event.status());
+            out.writeSegment(AT).writeString(event.at());
             out.writeByte('}');
         }
 
-        private static byte[] ascii(String value) {
-            return value.getBytes(StandardCharsets.US_ASCII);
+        private static void writeLine(JsonSink sink, OrderLine line) {
+            sink.writeSegment(SKU).writeString(line.sku());
+            sink.writeSegment(NAME).writeString(line.name());
+            sink.writeSegment(QUANTITY).writeInt(line.quantity());
+            sink.writeSegment(UNIT_PRICE_CENTS).writeLong(line.unitPriceCents());
+            sink.writeSegment(DISCOUNTED).writeBoolean(line.discounted());
+            sink.writeByte('}');
+        }
+
+        private static void writeAddress(JsonSink sink, ShippingAddress address) {
+            sink.writeSegment(COUNTRY).writeString(address.country());
+            sink.writeSegment(CITY).writeString(address.city());
+            sink.writeSegment(LINE_1).writeString(address.line1());
+            sink.writeSegment(LINE_2).writeString(address.line2());
+            sink.writeSegment(POSTAL_CODE).writeString(address.postalCode());
+            sink.writeByte('}');
+        }
+
+        private static void writePayment(JsonSink sink, PaymentSummary payment) {
+            sink.writeSegment(METHOD).writeString(payment.method());
+            sink.writeSegment(CURRENCY).writeString(payment.currency());
+            sink.writeSegment(SUBTOTAL_CENTS).writeLong(payment.subtotalCents());
+            sink.writeSegment(DISCOUNT_CENTS).writeLong(payment.discountCents());
+            sink.writeSegment(SHIPPING_CENTS).writeLong(payment.shippingCents());
+            sink.writeSegment(TOTAL_CENTS).writeLong(payment.totalCents());
+            sink.writeByte('}');
+        }
+
+        private static void writeTimeline(JsonSink sink, TimelineEvent event) {
+            sink.writeSegment(TIMELINE_STATUS).writeString(event.status());
+            sink.writeSegment(AT).writeString(event.at());
+            sink.writeByte('}');
         }
     }
 
@@ -1021,9 +1240,16 @@ public final class RealisticLoadSimulation {
         private final HttpHeaders headers = new HttpHeaders();
 
         private SimpleInputMessage(byte[] body) {
+            this(body, null);
+        }
+
+        private SimpleInputMessage(byte[] body, String endpoint) {
             this.body = body;
             headers.setContentType(MediaType.APPLICATION_JSON);
             headers.setContentLength(body.length);
+            if (endpoint != null) {
+                headers.set(ENDPOINT_HEADER, endpoint);
+            }
         }
 
         @Override
@@ -1040,6 +1266,16 @@ public final class RealisticLoadSimulation {
     private static final class SimpleOutputMessage implements HttpOutputMessage {
         private final ObservedByteArrayOutputStream body = new ObservedByteArrayOutputStream(2048);
         private final HttpHeaders headers = new HttpHeaders();
+
+        private SimpleOutputMessage() {
+            this(null);
+        }
+
+        private SimpleOutputMessage(String endpoint) {
+            if (endpoint != null) {
+                headers.set(ENDPOINT_HEADER, endpoint);
+            }
+        }
 
         @Override
         public OutputStream getBody() {
@@ -1071,6 +1307,16 @@ public final class RealisticLoadSimulation {
     private static final class SinkOutputMessage implements HttpOutputMessage {
         private final ObservedSinkOutputStream body = new ObservedSinkOutputStream();
         private final HttpHeaders headers = new HttpHeaders();
+
+        private SinkOutputMessage() {
+            this(null);
+        }
+
+        private SinkOutputMessage(String endpoint) {
+            if (endpoint != null) {
+                headers.set(ENDPOINT_HEADER, endpoint);
+            }
+        }
 
         @Override
         public OutputStream getBody() {

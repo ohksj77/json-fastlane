@@ -1,6 +1,7 @@
 package io.jsonfastlane.spring;
 
 import io.jsonfastlane.JsonFastlane;
+import io.jsonfastlane.JsonFastlaneGeneratedWriter;
 
 import java.util.Collection;
 import java.util.Map;
@@ -40,6 +41,10 @@ public final class JsonConversionProfiler {
 
     public JsonFastlane shapeProfiler() {
         return shapeProfiler;
+    }
+
+    public void registerExpectedShape(String endpoint, JsonFastlaneGeneratedWriter<?> writer) {
+        shapeProfiler.registerExpectedShape(endpoint, writer);
     }
 
     private static final class TimedConversionProfile {

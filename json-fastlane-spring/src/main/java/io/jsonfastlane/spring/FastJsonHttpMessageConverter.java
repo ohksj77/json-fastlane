@@ -10,11 +10,13 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.http.converter.HttpMessageNotWritableException;
 
 import java.io.IOException;
+import java.util.Objects;
 
 public final class FastJsonHttpMessageConverter extends AbstractHttpMessageConverter<Object> {
     private final JsonConversionProfiler profiler;
     private final FastJsonWriterRegistry writerRegistry;
-    private final ThreadLocal<Utf8JsonBuffer> writerBuffers = ThreadLocal.withInitial(() -> new Utf8JsonBuffer(2048));
+    private final JsonBufferFactory bufferFactory;
+    private final EndpointResolver endpointResolver;
     private volatile Class<?> cachedWriterType;
     private volatile FastJsonBufferWriter<?> cachedWriter;
 
@@ -22,9 +24,28 @@ public final class FastJsonHttpMessageConverter extends AbstractHttpMessageConve
         JsonConversionProfiler profiler,
         FastJsonWriterRegistry writerRegistry
     ) {
+        this(profiler, writerRegistry, JsonBufferFactory.defaultFactory());
+    }
+
+    public FastJsonHttpMessageConverter(
+        JsonConversionProfiler profiler,
+        FastJsonWriterRegistry writerRegistry,
+        JsonBufferFactory bufferFactory
+    ) {
+        this(profiler, writerRegistry, bufferFactory, EndpointResolver.unknown());
+    }
+
+    public FastJsonHttpMessageConverter(
+        JsonConversionProfiler profiler,
+        FastJsonWriterRegistry writerRegistry,
+        JsonBufferFactory bufferFactory,
+        EndpointResolver endpointResolver
+    ) {
         super(MediaType.APPLICATION_JSON);
         this.profiler = profiler;
         this.writerRegistry = writerRegistry;
+        this.bufferFactory = Objects.requireNonNull(bufferFactory, "bufferFactory");
+        this.endpointResolver = Objects.requireNonNull(endpointResolver, "endpointResolver");
     }
 
     @Override
@@ -47,7 +68,7 @@ public final class FastJsonHttpMessageConverter extends AbstractHttpMessageConve
             throw new HttpMessageNotWritableException("No generated JSON writer registered for " + object.getClass());
         }
 
-        Utf8JsonBuffer out = writerBuffers.get().reset();
+        Utf8JsonBuffer out = bufferFactory.create();
         long start = System.nanoTime();
         writer.write(object, out);
         long elapsed = System.nanoTime() - start;
@@ -56,7 +77,7 @@ public final class FastJsonHttpMessageConverter extends AbstractHttpMessageConve
         out.writeTo(outputMessage.getBody());
 
         profiler.recordConversion(new ConversionRoute(
-            JsonFastlaneSpring.currentEndpoint(),
+            endpointResolver.resolveWrite(outputMessage),
             ConversionDirection.WRITE,
             object.getClass().getName()
         ), out.size(), elapsed);
