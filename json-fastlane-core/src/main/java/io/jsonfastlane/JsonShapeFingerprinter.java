@@ -14,7 +14,16 @@ public final class JsonShapeFingerprinter {
     }
 
     public static JsonShapeFingerprint fingerprint(byte[] utf8Json, JsonFastlaneOptions options) {
-        Parser parser = new Parser(utf8Json, options, CheckpointObserver.NONE);
+        Parser parser = new Parser(utf8Json, options, CheckpointObserver.NONE, false);
+        return parser.fingerprint();
+    }
+
+    public static JsonShapeFingerprint skeletonFingerprint(byte[] utf8Json) {
+        return skeletonFingerprint(utf8Json, JsonFastlaneOptions.defaults());
+    }
+
+    public static JsonShapeFingerprint skeletonFingerprint(byte[] utf8Json, JsonFastlaneOptions options) {
+        Parser parser = new Parser(utf8Json, options, CheckpointObserver.NONE, true);
         return parser.fingerprint();
     }
 
@@ -26,13 +35,21 @@ public final class JsonShapeFingerprinter {
         return fingerprint(json.getBytes(StandardCharsets.UTF_8), options);
     }
 
+    public static JsonShapeFingerprint skeletonFingerprint(String json) {
+        return skeletonFingerprint(json.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public static JsonShapeFingerprint skeletonFingerprint(String json, JsonFastlaneOptions options) {
+        return skeletonFingerprint(json.getBytes(StandardCharsets.UTF_8), options);
+    }
+
     public static JsonShapeFingerprintPlan plan(byte[] utf8Json) {
         return plan(utf8Json, JsonFastlaneOptions.defaults());
     }
 
     public static JsonShapeFingerprintPlan plan(byte[] utf8Json, JsonFastlaneOptions options) {
         CollectingCheckpointObserver observer = new CollectingCheckpointObserver();
-        Parser parser = new Parser(utf8Json, options, observer);
+        Parser parser = new Parser(utf8Json, options, observer, false);
         JsonShapeFingerprint fingerprint = parser.fingerprint();
         return new JsonShapeFingerprintPlan(fingerprint, observer.checkpoints());
     }
@@ -52,7 +69,7 @@ public final class JsonShapeFingerprinter {
     public static boolean matches(byte[] utf8Json, JsonShapeFingerprintPlan plan, JsonFastlaneOptions options) {
         Objects.requireNonNull(plan, "plan");
         try {
-            Parser parser = new Parser(utf8Json, options, new VerifyingCheckpointObserver(plan.checkpoints()));
+            Parser parser = new Parser(utf8Json, options, new VerifyingCheckpointObserver(plan.checkpoints()), false);
             return plan.fingerprint().sameHash(parser.fingerprint());
         } catch (IllegalArgumentException ignored) {
             return false;
@@ -63,16 +80,23 @@ public final class JsonShapeFingerprinter {
         private final byte[] bytes;
         private final JsonFastlaneOptions options;
         private final CheckpointObserver checkpointObserver;
+        private final boolean normalizeArrays;
         private final ShapeHash128 hash = new ShapeHash128();
         private int index;
         private int fieldCount;
         private int keyEventCount;
         private int maxKeyDepth;
 
-        private Parser(byte[] bytes, JsonFastlaneOptions options, CheckpointObserver checkpointObserver) {
+        private Parser(
+            byte[] bytes,
+            JsonFastlaneOptions options,
+            CheckpointObserver checkpointObserver,
+            boolean normalizeArrays
+        ) {
             this.bytes = Objects.requireNonNull(bytes, "bytes");
             this.options = Objects.requireNonNull(options, "options");
             this.checkpointObserver = Objects.requireNonNull(checkpointObserver, "checkpointObserver");
+            this.normalizeArrays = normalizeArrays;
         }
 
         private JsonShapeFingerprint fingerprint() {
@@ -201,8 +225,12 @@ public final class JsonShapeFingerprinter {
 
             int itemCount = 0;
             while (!isAtEnd()) {
-                hash.addArrayItem(valueDepth, itemCount, peekValueKind());
-                skipValue(valueDepth);
+                if (!normalizeArrays || itemCount == 0) {
+                    hash.addArrayItem(valueDepth, normalizeArrays ? 0 : itemCount, peekValueKind());
+                    skipValue(valueDepth);
+                } else {
+                    skipValueWithoutHash(valueDepth);
+                }
                 itemCount++;
                 skipWhitespace();
 
@@ -212,13 +240,103 @@ public final class JsonShapeFingerprinter {
                 }
                 if (peek(']')) {
                     index++;
-                    hash.addArrayEnd(valueDepth, itemCount);
+                    hash.addArrayEnd(valueDepth, normalizeArrays ? Math.min(itemCount, 1) : itemCount);
                     return;
                 }
 
                 throw error("Expected ',' or ']'");
             }
 
+            throw error("Unterminated array");
+        }
+
+        private JsonValueKind skipValueWithoutHash(int valueDepth) {
+            checkDepth(valueDepth + 1);
+            skipWhitespace();
+            if (isAtEnd()) {
+                return JsonValueKind.UNKNOWN;
+            }
+
+            int current = bytes[index] & 0xff;
+            return switch (current) {
+                case '"' -> {
+                    skipString();
+                    yield JsonValueKind.STRING;
+                }
+                case '{' -> {
+                    skipObjectWithoutHash(valueDepth);
+                    yield JsonValueKind.OBJECT;
+                }
+                case '[' -> {
+                    skipArrayWithoutHash(valueDepth);
+                    yield JsonValueKind.ARRAY;
+                }
+                case 't', 'f' -> {
+                    skipBoolean();
+                    yield JsonValueKind.BOOLEAN;
+                }
+                case 'n' -> {
+                    skipNull();
+                    yield JsonValueKind.NULL;
+                }
+                default -> {
+                    if (current == '-' || isDigit(current)) {
+                        skipNumber();
+                        yield JsonValueKind.NUMBER;
+                    }
+                    throw error("Unexpected value");
+                }
+            };
+        }
+
+        private void skipObjectWithoutHash(int valueDepth) {
+            checkDepth(valueDepth + 1);
+            expect('{');
+            skipWhitespace();
+            if (peek('}')) {
+                index++;
+                return;
+            }
+            while (!isAtEnd()) {
+                skipString();
+                skipWhitespace();
+                expect(':');
+                skipValueWithoutHash(valueDepth + 1);
+                skipWhitespace();
+                if (peek(',')) {
+                    index++;
+                    continue;
+                }
+                if (peek('}')) {
+                    index++;
+                    return;
+                }
+                throw error("Expected ',' or '}'");
+            }
+            throw error("Unterminated object");
+        }
+
+        private void skipArrayWithoutHash(int valueDepth) {
+            checkDepth(valueDepth + 1);
+            expect('[');
+            skipWhitespace();
+            if (peek(']')) {
+                index++;
+                return;
+            }
+            while (!isAtEnd()) {
+                skipValueWithoutHash(valueDepth);
+                skipWhitespace();
+                if (peek(',')) {
+                    index++;
+                    continue;
+                }
+                if (peek(']')) {
+                    index++;
+                    return;
+                }
+                throw error("Expected ',' or ']'");
+            }
             throw error("Unterminated array");
         }
 

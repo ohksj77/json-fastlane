@@ -15,8 +15,11 @@ what is needed before the project can feel like a broad JSON stack replacement.
 | Byte scanner | Shape profiling scans UTF-8 bytes directly instead of first creating full JSON strings. |
 | Packed field order | Short field-order signatures use packed `long` keys, with array fallback for larger shapes. |
 | Expected shapes | Users can register shapes from JSON samples or `ExpectedJsonShape` objects. |
+| Fast-path candidate report | `JsonFastlaneReport.candidates` scores endpoints and `fastPathCandidateReport` reads synthetic, TSV, or directory samples with endpoint mapping, field redaction, and text/JSON output. |
+| Candidate regression gate | `compareFastPathCandidateReports` compares JSON reports and fails on score, stability, or dropped-order regressions. |
 | Exact shape matcher | `CompiledJsonShapeMatcher` routes stable payloads to hot paths. |
 | Shape fingerprint | `JsonShapeHashMatcher` supports full key/depth/value-kind hashes and exact verification. |
+| Skeleton fingerprint | Homogeneous-array skeleton hashes support variable-length list shape discovery. |
 | Checkpoints | `JsonShapeFingerprintPlan` stores geometric checkpoints for early mismatch rejection. |
 | Writer generation | Java record writers are generated through `@JsonFastlaneGenerateWriter`. |
 | Generated writer metadata | Generated writers expose `ExpectedJsonShape` for profiler priming. |
@@ -35,20 +38,20 @@ what is needed before the project can feel like a broad JSON stack replacement.
 | Transport lane | Sink-based writes work for generated/manual paths and are compared in load/JMH runs. | It is not yet a full scatter/gather network runtime. |
 | ObjectMapper replacement | Selected generated DTO paths can bypass Jackson. | Full annotation/module/polymorphism behavior still belongs to Jackson. |
 | WebFlux | Netty writer pieces exist. | Dedicated codec and backpressure-aware integration are future work. |
-| Homogeneous arrays | Strict fingerprints include repeated keys and array length. | A skeleton mode is needed for variable-length list shapes. |
+| Homogeneous arrays | Skeleton fingerprints normalize variable-length list shapes for discovery. | Routing still needs exact verification or generated reader fallback behavior. |
 
 ## Next Deep Work
 
 1. Generate `TryFastJsonReader` implementations from retained shapes.
-2. Add processor coverage for more DTO features: boxed values, enums, nested records,
+2. Turn captured-sample candidate reports into a production-facing CLI with richer endpoint mapping, safer redaction, and richer regression policies for CI artifacts.
+3. Add processor coverage for more DTO features: boxed values, enums, nested records,
    nullable fields, collections, and explicit unsupported-feature diagnostics.
-3. Add homogeneous-array skeleton fingerprints so variable-length lists can share
-   one shape when element structure is stable.
-4. Extend transport benchmarks to large arrays and mixed optional-field shapes.
-5. Add a WebFlux codec on top of the Netty writer registry.
-6. Design an optional facade that looks closer to `ObjectMapper` for generated
+4. Use skeleton fingerprints in candidate scoring so list-heavy endpoints are ranked more accurately.
+5. Extend transport benchmarks to large arrays and mixed optional-field shapes.
+6. Add a WebFlux codec on top of the Netty writer registry.
+7. Design an optional facade that looks closer to `ObjectMapper` for generated
    DTOs while still falling back for unsupported types.
-7. Add a compatibility matrix for Jackson features: naming strategy, null policy,
+8. Add a compatibility matrix for Jackson features: naming strategy, null policy,
    enum policy, date/time, custom serializers, polymorphism, and unknown fields.
 
 ## Decision Rule

@@ -121,10 +121,11 @@ fallback -> compatibility path
 1번째, 2번째, 4번째, 8번째 key checkpoint부터 어긋나면 matcher가 일찍 탈락시킬 수
 있습니다. top-level field order가 초반부터 다른 큰 payload에서 특히 유용합니다.
 
-현재 fingerprint는 key occurrence에 대해 strict합니다. array 길이가 다르면 array
-안에서 반복되는 object key event도 달라지므로 fingerprint가 달라집니다. generated
-codec이 variable-length list를 지원하는 경로에서는 이후 homogeneous array를
-정규화하는 skeleton mode를 추가할 수 있습니다.
+strict fingerprint는 key occurrence에 대해 exact합니다. array 길이가 다르면 array
+안에서 반복되는 object key event도 달라지므로 strict fingerprint가 달라집니다.
+`skeletonFingerprint`는 array 길이를 shape의 일부로 보지 않고 element shape를 hashing해서
+homogeneous array를 정규화합니다. list가 많은 endpoint의 candidate discovery에 유용하고,
+정확한 routing boundary에서는 strict fingerprint가 더 안전한 기본값으로 남습니다.
 
 ## Fallback
 

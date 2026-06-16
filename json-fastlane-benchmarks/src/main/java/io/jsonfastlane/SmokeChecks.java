@@ -5,6 +5,8 @@ import io.jsonfastlane.examples.CreateOrderRequestWriter;
 import io.jsonfastlane.examples.OrderItemRequest;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 public final class SmokeChecks {
@@ -20,8 +22,13 @@ public final class SmokeChecks {
         primesExpectedShapes();
         matchesCompiledShapes();
         hashesJsonShapes();
+        hashesHomogeneousArraySkeletons();
         keepsEndpointProfilesBounded();
         exportsReportsAndMetrics();
+        ranksFastPathCandidates();
+        comparesCandidateReports();
+        recordsCandidateReportSamplesFromFiles();
+        appliesCandidateReportConfig();
         writesWithGeneratedCodecContract();
         writesGeneratedStyleJson();
         System.out.println("Smoke checks passed.");
@@ -178,6 +185,25 @@ public final class SmokeChecks {
         ), "verified shape hash matcher hit");
     }
 
+    private static void hashesHomogeneousArraySkeletons() {
+        String oneItem = "{\"items\":[{\"sku\":\"A\",\"quantity\":1}]}";
+        String threeItems = "{\"items\":[{\"sku\":\"A\",\"quantity\":1},{\"sku\":\"B\",\"quantity\":2},{\"sku\":\"C\",\"quantity\":3}]}";
+        String differentElement = "{\"items\":[{\"sku\":\"A\",\"count\":1}]}";
+
+        require(!JsonShapeFingerprinter.fingerprint(oneItem).sameHash(JsonShapeFingerprinter.fingerprint(threeItems)),
+            "strict shape hash includes array length");
+        require(JsonShapeFingerprinter.skeletonFingerprint(oneItem)
+            .sameHash(JsonShapeFingerprinter.skeletonFingerprint(threeItems)),
+            "skeleton shape hash ignores homogeneous array length");
+        require(!JsonShapeFingerprinter.skeletonFingerprint(oneItem)
+            .sameHash(JsonShapeFingerprinter.skeletonFingerprint(differentElement)),
+            "skeleton shape hash detects element shape drift");
+
+        JsonShapeHashMatcher matcher = JsonShapeHashMatcher.skeletonFromSample(oneItem);
+        require(matcher.matches(threeItems), "skeleton matcher hit");
+        require(!matcher.matches(differentElement), "skeleton matcher miss");
+    }
+
     private static void keepsEndpointProfilesBounded() {
         JsonFastlane fastlane = new JsonFastlane(new JsonFastlaneOptions(8, 8, 8, 8, 1));
         fastlane.record("/one", "{\"a\":1}");
@@ -198,6 +224,129 @@ public final class SmokeChecks {
         CountingMetricsSink sink = new CountingMetricsSink();
         JsonFastlaneReport.emitMetrics(fastlane.snapshots(), sink);
         require(sink.metrics == 3, "metric export count");
+
+        String json = JsonFastlaneReport.json(fastlane.snapshots());
+        require(json.contains("\"endpoints\""), "json report endpoints");
+        require(json.contains("\"candidates\""), "json report candidates");
+        require(json.contains("\"endpoint\":\"/orders\""), "json report endpoint");
+        require(json.contains("\"hotFieldOrder\":\"userId,items\""), "json report hot order");
+    }
+
+    private static void ranksFastPathCandidates() {
+        JsonFastlane fastlane = new JsonFastlane();
+        for (int i = 0; i < 100; i++) {
+            fastlane.record("/stable", "{\"userId\":" + i + ",\"items\":[],\"couponCode\":null}");
+        }
+        fastlane.record("/variable", "{\"userId\":1,\"items\":[]}");
+        fastlane.record("/variable", "{\"items\":[],\"userId\":2}");
+
+        List<JsonFastlaneCandidate> candidates = JsonFastlaneReport.candidates(fastlane.snapshots());
+        JsonFastlaneCandidate stable = candidates.get(0);
+        require(stable.endpoint().equals("/stable"), "candidate ranking");
+        require(stable.recommended(), "candidate recommended");
+        require(stable.recommendation().equals("generate-fast-path"), "candidate recommendation");
+        require(stable.hotFieldOrder().equals("userId,items,couponCode"), "candidate hot order");
+
+        String report = JsonFastlaneReport.text(fastlane.snapshots());
+        require(report.contains("fast-path candidates"), "candidate report section");
+        require(report.contains("recommendation=generate-fast-path"), "candidate report recommendation");
+    }
+
+    private static void comparesCandidateReports() {
+        String baseline = candidateReportJson(90, 1.0, 0);
+        String currentPass = candidateReportJson(75, 0.85, 0);
+        String currentFail = candidateReportJson(50, 0.60, 1);
+
+        FastPathReportComparator.Comparison pass = FastPathReportComparator.compare(
+            baseline, currentPass, 20, 0.20);
+        require(pass.passed(), "candidate comparison pass");
+        require(pass.report().contains("PASS /orders"), "candidate comparison pass report");
+
+        FastPathReportComparator.Comparison fail = FastPathReportComparator.compare(
+            baseline, currentFail, 20, 0.20);
+        require(!fail.passed(), "candidate comparison fail");
+        require(fail.report().contains("FAIL /orders"), "candidate comparison fail report");
+    }
+
+    private static String candidateReportJson(int score, double hotOrderRatio, long droppedFieldOrders) {
+        return "{\"endpoints\":[],\"candidates\":[{"
+            + "\"endpoint\":\"/orders\","
+            + "\"samples\":100,"
+            + "\"averagePayloadBytes\":64,"
+            + "\"hotFieldOrder\":\"userId,items\","
+            + "\"hotFieldOrderSamples\":100,"
+            + "\"hotFieldOrderRatio\":" + hotOrderRatio + ","
+            + "\"fieldCount\":2,"
+            + "\"droppedFieldOrders\":" + droppedFieldOrders + ","
+            + "\"score\":" + score + ","
+            + "\"recommended\":true,"
+            + "\"recommendation\":\"generate-fast-path\""
+            + "}]}";
+    }
+
+    private static void recordsCandidateReportSamplesFromFiles() {
+        try {
+            Path directory = Files.createTempDirectory("json-fastlane-samples");
+            Path lines = directory.resolve("samples.tsv");
+            Files.writeString(lines,
+                "/orders\t{\"userId\":1,\"items\":[]}\n"
+                    + "/orders\t{\"userId\":2,\"items\":[]}\n",
+                StandardCharsets.UTF_8);
+
+            JsonFastlane fromLines = new JsonFastlane();
+            FastPathCandidateReport.recordCapturedSamples(fromLines, lines);
+            EndpointProfileSnapshot lineSnapshot = fromLines.snapshots().iterator().next();
+            require(lineSnapshot.endpoint().equals("/orders"), "line sample endpoint");
+            require(lineSnapshot.samples() == 2, "line sample count");
+
+            Path apiDirectory = directory.resolve("api");
+            Files.createDirectories(apiDirectory.resolve("orders"));
+            Files.writeString(apiDirectory.resolve("orders/create-1.json"),
+                "{\"userId\":1,\"items\":[]}", StandardCharsets.UTF_8);
+            Files.writeString(apiDirectory.resolve("orders/create-2.json"),
+                "{\"userId\":2,\"items\":[]}", StandardCharsets.UTF_8);
+
+            JsonFastlane fromDirectory = new JsonFastlane();
+            FastPathCandidateReport.recordCapturedSamples(fromDirectory, apiDirectory);
+            EndpointProfileSnapshot directorySnapshot = fromDirectory.snapshots().iterator().next();
+            require(directorySnapshot.endpoint().equals("/orders/create"), "directory sample endpoint");
+            require(directorySnapshot.samples() == 2, "directory sample count");
+            require(FastPathCandidateReport.endpointFromPath(apiDirectory, apiDirectory.resolve("orders/create-12.json"))
+                .equals("/orders/create"), "directory endpoint normalization");
+        } catch (Exception exception) {
+            throw new AssertionError("Failed: candidate report sample files", exception);
+        }
+    }
+
+    private static void appliesCandidateReportConfig() {
+        try {
+            Path directory = Files.createTempDirectory("json-fastlane-configured-samples");
+            Path lines = directory.resolve("samples.tsv");
+            Files.writeString(lines,
+                "/orders/1\t{\"userId\":1,\"email\":\"a@example.com\",\"items\":[]}\n"
+                    + "/orders/2\t{\"userId\":2,\"email\":\"b@example.com\",\"items\":[]}\n",
+                StandardCharsets.UTF_8);
+            Path configFile = directory.resolve("candidate.properties");
+            Files.writeString(configFile,
+                "endpoint./orders/=/orders/{id}\n"
+                    + "redactFields=email\n",
+                StandardCharsets.UTF_8);
+
+            JsonFastlane fastlane = new JsonFastlane();
+            FastPathCandidateReport.ReportConfig config = FastPathCandidateReport.ReportConfig.load(configFile.toString());
+            FastPathCandidateReport.recordCapturedSamples(fastlane, lines, config);
+
+            EndpointProfileSnapshot snapshot = fastlane.snapshots().iterator().next();
+            require(snapshot.endpoint().equals("/orders/{id}"), "configured endpoint mapping");
+            require(snapshot.samples() == 2, "configured sample count");
+            FieldProfileSnapshot email = snapshot.fields().stream()
+                .filter(field -> field.name().equals("email"))
+                .findFirst()
+                .orElseThrow();
+            require(email.valueKinds().get(JsonValueKind.NULL) == 2, "configured redaction kind");
+        } catch (Exception exception) {
+            throw new AssertionError("Failed: candidate report config", exception);
+        }
     }
 
     private static void writesWithGeneratedCodecContract() {

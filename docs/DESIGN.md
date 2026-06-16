@@ -125,10 +125,12 @@ matcher can reject early if the 1st, 2nd, 4th, or 8th key checkpoint already
 differs. This is especially useful for large payloads whose top-level field
 order diverges early.
 
-The current fingerprint is strict about key occurrences. Arrays with different
-lengths produce different fingerprints because repeated object keys inside the
-array are part of the event stream. A future skeleton mode can normalize
-homogeneous arrays when the generated codec supports variable-length lists.
+The strict fingerprint is exact about key occurrences. Arrays with different
+lengths produce different strict fingerprints because repeated object keys inside
+the array are part of the event stream. `skeletonFingerprint` normalizes
+homogeneous arrays by hashing the element shape without treating array length as
+part of the shape. This is useful for list-heavy candidate discovery, while
+strict fingerprints remain the safer default for exact routing boundaries.
 
 ## Fallback
 

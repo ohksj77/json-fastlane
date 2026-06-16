@@ -81,6 +81,29 @@ val transportLaneSmokeTest by tasks.registering(JavaExec::class) {
     mainClass.set("io.jsonfastlane.TransportLaneSmokeChecks")
 }
 
+val fastPathCandidateReport by tasks.registering(JavaExec::class) {
+    group = "verification"
+    description = "Prints a sample json-fastlane fast-path candidate report."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("io.jsonfastlane.FastPathCandidateReport")
+    systemProperty("jsonfastlane.report.samples", findProperty("candidateSamples") ?: "")
+    systemProperty("jsonfastlane.report.config", findProperty("candidateConfig") ?: "")
+    systemProperty("jsonfastlane.report.output", findProperty("candidateOutput") ?: "text")
+    systemProperty("jsonfastlane.report.stableSamples", findProperty("candidateStableSamples") ?: "250")
+    systemProperty("jsonfastlane.report.driftingSamples", findProperty("candidateDriftingSamples") ?: "60")
+}
+
+val compareFastPathCandidateReports by tasks.registering(JavaExec::class) {
+    group = "verification"
+    description = "Compares two json-fastlane JSON candidate reports for CI regressions."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("io.jsonfastlane.FastPathReportComparator")
+    systemProperty("jsonfastlane.compare.baseline", findProperty("baselineReport") ?: "")
+    systemProperty("jsonfastlane.compare.current", findProperty("currentReport") ?: "")
+    systemProperty("jsonfastlane.compare.maxScoreDrop", findProperty("maxScoreDrop") ?: "20")
+    systemProperty("jsonfastlane.compare.maxHotOrderRatioDrop", findProperty("maxHotOrderRatioDrop") ?: "0.20")
+}
+
 val realisticLoadTest by tasks.registering(JavaExec::class) {
     group = "verification"
     description = "Runs a realistic in-process JSON serialization load simulation."

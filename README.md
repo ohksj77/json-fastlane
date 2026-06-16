@@ -30,9 +30,11 @@ until a generated codec covers the case safely.
 
 - Profiles endpoint JSON shape from raw UTF-8 bytes.
 - Tracks field order, value kind, payload size, sample count, and dropped shapes.
+- Ranks fast-path candidates by sample count, hot field-order stability, payload size, and drift risk.
 - Registers expected JSON shapes from samples or code.
 - Compiles exact shape matchers for hot-path routing.
 - Computes 128-bit key/depth/value-kind fingerprints with checkpointed early rejection.
+- Computes homogeneous-array skeleton fingerprints for variable-length list shapes.
 - Generates Java record writers with `@JsonFastlaneGenerateWriter`.
 - Writes to `Utf8JsonBuffer`, Netty `ByteBuf`, or `OutputStream` through `JsonSink`.
 - Provides Spring MVC and Netty adapter prototypes.
@@ -45,7 +47,9 @@ Implemented today:
 | Area | State |
 | --- | --- |
 | Shape profiler | Byte scanner, bounded endpoint/order tracking, compact field-order storage. |
+| Candidate report | Fast-path candidate scoring and a sample Gradle report task. |
 | Shape guards | Exact matcher, fingerprint matcher, checkpointed early rejection. |
+| Skeleton fingerprint | Variable-length homogeneous arrays can share a shape fingerprint. |
 | Writer generation | Java record writer processor with expected-shape metadata. |
 | Transport lane | `JsonSink` targets for UTF-8, Netty, and `OutputStream`. |
 | Spring/Netty adapters | Prototype converters and writer registries. |
@@ -84,9 +88,40 @@ Run the local checks:
 
 ```bash
 ./gradlew check
+./gradlew fastPathCandidateReport
+./gradlew fastPathCandidateReport -PcandidateSamples=/path/to/samples.tsv
+./gradlew fastPathCandidateReport -PcandidateSamples=/path/to/samples.tsv -PcandidateConfig=/path/to/candidate.properties
+./gradlew fastPathCandidateReport -PcandidateSamples=/path/to/samples.tsv -PcandidateOutput=json
+./gradlew compareFastPathCandidateReports -PbaselineReport=/path/to/baseline.json -PcurrentReport=/path/to/current.json
 ./gradlew realisticLoadTest
 ./gradlew jmh -PjmhWarmups=1 -PjmhIterations=1 -PjmhForks=1
 ```
+
+Captured sample files can use one JSON payload per line:
+
+```text
+/orders	{"userId":1,"items":[]}
+/orders	{"userId":2,"items":[]}
+```
+
+`candidateSamples` may also point at a directory of `.json` files. File paths are
+converted to endpoint names, and numeric suffixes like `orders/create-1.json`
+are grouped as `/orders/create`.
+
+Optional candidate config uses Java `.properties` syntax:
+
+```properties
+endpoint./orders/=/orders/{id}
+redactFields=email,token
+```
+
+`endpoint.<prefix>=<target>` groups captured endpoint names before scoring.
+`redactFields` replaces matching top-level JSON field values with `null` before
+profiling so sensitive scalar values do not affect captured reports.
+
+Use `-PcandidateOutput=json` when the report is consumed by CI or another tool.
+Use `compareFastPathCandidateReports` to fail CI when a current report has a
+large score drop, hot-order stability drop, or dropped-order increase.
 
 Record shapes:
 
@@ -99,6 +134,10 @@ fastlane.record("/orders", "{\"userId\":2,\"items\":[],\"couponCode\":\"HELLO\"}
 for (EndpointProfileSnapshot snapshot : fastlane.snapshots()) {
     System.out.println(snapshot.endpoint());
     System.out.println(snapshot.fieldOrders());
+}
+
+for (JsonFastlaneCandidate candidate : JsonFastlaneReport.candidates(fastlane.snapshots())) {
+    System.out.println(candidate.endpoint() + " " + candidate.recommendation());
 }
 ```
 
